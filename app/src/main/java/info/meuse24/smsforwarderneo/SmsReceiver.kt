@@ -16,12 +16,15 @@ import androidx.work.WorkManager
  * SmsReceiver ist ein BroadcastReceiver, der eingehende SMS-Nachrichten empfängt und verarbeitet.
  * Er kümmert sich um die Weiterleitung von SMS, wenn diese Funktion aktiviert ist.
  */
+
 class SmsReceiver : BroadcastReceiver() {
+
     companion object {
         private const val TAG = "SmsReceiver"
     }
     // SharedPreferencesManager wird für den Zugriff auf gespeicherte Einstellungen verwendet
     private lateinit var prefsManager: SharedPreferencesManager
+
 
     /**
      * Diese Methode wird aufgerufen, wenn eine Broadcast-Nachricht empfangen wird.
