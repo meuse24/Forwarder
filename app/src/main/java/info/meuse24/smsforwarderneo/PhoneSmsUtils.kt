@@ -196,6 +196,7 @@ class PhoneSmsUtils private constructor() {
                         deliveredIntents
                     )
                     Log.i(TAG, "Multipart SMS sent to $phoneNumber (${parts.size} parts)")
+                    logMsg("Multipart SMS sent to $phoneNumber (${parts.size} parts)")
                 } else {
                     val sentIntent = PendingIntent.getBroadcast(
                         context,
@@ -217,6 +218,7 @@ class PhoneSmsUtils private constructor() {
                         deliveredIntent
                     )
                     Log.i(TAG, "Single SMS sent to $phoneNumber")
+                    logMsg("Single SMS sent to $phoneNumber")
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "Error sending SMS", e)

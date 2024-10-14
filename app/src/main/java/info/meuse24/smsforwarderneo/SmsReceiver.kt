@@ -29,12 +29,13 @@ class SmsReceiver : BroadcastReceiver() {
      */
     override fun onReceive(context: Context, intent: Intent) {
         Log.d(TAG, "onReceive: ${intent.action}")
+        prefsManager = SharedPreferencesManager(context)
 
         // Überprüfen Sie die Berechtigung des Senders
-        if (context.checkCallingOrSelfPermission(android.Manifest.permission.BROADCAST_SMS) != PackageManager.PERMISSION_GRANTED) {
-            Log.w(TAG, "Received intent from sender without BROADCAST_SMS permission")
-            return
-        }
+//        if (context.checkCallingOrSelfPermission(android.Manifest.permission.BROADCAST_SMS) != PackageManager.PERMISSION_GRANTED) {
+//            Log.w(TAG, "Received intent from sender without BROADCAST_SMS permission")
+//            return
+//        }
 
         when (intent.action) {
             Telephony.Sms.Intents.SMS_RECEIVED_ACTION -> {
@@ -98,6 +99,7 @@ class SmsReceiver : BroadcastReceiver() {
                 prefsManager.getSelectedPhoneNumber()?.let { forwardToNumber ->
                     // Erstellt die vollständige Nachricht mit Absenderinformation
                     val fullMessage = "Von: $sender\n$messageBody"
+                    Log.d(TAG, "SMS Weiterleitung: $fullMessage")
                     // Leitet die Nachricht über den SmsWorker weiter
                     forwardSmsWithSmsWorker(context, forwardToNumber, fullMessage)
                 }
