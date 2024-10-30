@@ -1,9 +1,24 @@
+import com.android.Version
+import org.jetbrains.kotlin.config.KotlinCompilerVersion
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
 }
 
 android {
+    buildFeatures {
+        compose = true
+        buildConfig = true  // Hier hinzufügen
+    }
+
+    composeOptions {
+        kotlinCompilerExtensionVersion = "1.5.1"
+    }
+
     namespace = "info.meuse24.smsforwarderneo"
     compileSdk = 34
 
@@ -12,7 +27,41 @@ android {
         minSdk = 29
         targetSdk = 34
         versionCode = 1
-        versionName = "Beta"
+        versionName = "Anchovy"
+
+        val agpVersion = Version.ANDROID_GRADLE_PLUGIN_VERSION
+        buildConfigField("String", "AGP_VERSION", "\"$agpVersion\"")
+        buildConfigField("String", "KOTLIN_VERSION", "\"${KotlinCompilerVersion.VERSION}\"")
+
+        // Compose Version aus den Abhängigkeiten
+        val composeVersion = project.configurations
+            .findByName("implementation")
+            ?.dependencies
+            ?.find { it.group == "androidx.compose.runtime" && it.name == "runtime" }
+            ?.version ?: "unknown"
+        buildConfigField("String", "COMPOSE_VERSION", "\"$composeVersion\"")
+
+        // Neue Build Config Fields
+
+        buildTypes {
+            debug {
+                val sdf = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault())
+                buildConfigField("String", "BUILD_TIME", "\"${sdf.format(Date())}\"")
+                buildConfigField("String", "GRADLE_VERSION", "\"${gradle.gradleVersion}\"")
+                buildConfigField("String", "BUILD_TYPE", "\"debug\"")
+            }
+            release {
+                val sdf = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault())
+                buildConfigField("String", "BUILD_TIME", "\"${sdf.format(Date())}\"")
+                buildConfigField("String", "GRADLE_VERSION", "\"${gradle.gradleVersion}\"")
+                buildConfigField("String", "BUILD_TYPE", "\"release\"")
+            }
+        }
+
+        buildConfigField("String", "JDK_VERSION", "\"${System.getProperty("java.version")}\"")
+        buildConfigField("String", "BUILD_TOOLS_VERSION", "\"${android.buildToolsVersion}\"")
+        buildConfigField("String", "CMAKE_VERSION", "\"${project.findProperty("cmake.version") ?: "not used"}\"")
+        buildConfigField("String", "NDK_VERSION", "\"${project.findProperty("android.ndkVersion") ?: "not used"}\"")
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
@@ -63,6 +112,9 @@ dependencies {
     implementation(libs.androidx.appcompat)
     implementation(libs.androidx.room.common)
     implementation(libs.androidx.security.crypto)
+    implementation(libs.libphonenumber)
+    implementation(libs.androidx.espresso.core)
+
     testImplementation(libs.junit)
 
     androidTestImplementation(libs.androidx.junit)

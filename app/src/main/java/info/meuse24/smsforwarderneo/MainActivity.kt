@@ -1,25 +1,20 @@
 package info.meuse24.smsforwarderneo
 
-import android.app.AlertDialog
+
 import android.content.Context
 import android.content.Intent
 import android.content.res.Configuration
+import android.os.Build
 import android.os.Bundle
+import android.util.Log
 import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
-import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.animation.core.LinearEasing
-import androidx.compose.animation.core.RepeatMode
-import androidx.compose.animation.core.animateFloat
-import androidx.compose.animation.core.infiniteRepeatable
-import androidx.compose.animation.core.rememberInfiniteTransition
-import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -44,11 +39,10 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.List
 import androidx.compose.material.icons.filled.Clear
-import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.ExitToApp
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.Info
-import androidx.compose.material.icons.filled.Phone
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Settings
@@ -56,21 +50,18 @@ import androidx.compose.material.icons.filled.Share
 import androidx.compose.material3.Button
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
-import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
-import androidx.compose.material3.PlainTooltip
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TextField
-import androidx.compose.material3.TooltipBox
-import androidx.compose.material3.TooltipDefaults
-import androidx.compose.material3.rememberTooltipState
+import androidx.compose.material3.TextFieldDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -83,13 +74,9 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.ColorFilter
-import androidx.compose.ui.graphics.DefaultAlpha
 import androidx.compose.ui.graphics.RectangleShape
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.luminance
-import androidx.compose.ui.layout.ContentScale
-import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.res.painterResource
@@ -105,8 +92,14 @@ import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
-import kotlinx.coroutines.delay
 import java.util.Locale
+import androidx.compose.material3.AlertDialog
+import androidx.compose.ui.window.DialogProperties
+import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.launch
+import android.app.AlertDialog
+import android.content.DialogInterface
 
 object InterfaceHolder {
     var myInterface: MyInterface? = null
@@ -122,18 +115,40 @@ class MainActivity : ComponentActivity(), MyInterface {
     private lateinit var viewModel: ContactsViewModel
     private lateinit var logger: Logger
     private lateinit var prefsManager: SharedPreferencesManager
+    private lateinit var loggingHelper: LoggingHelper
+    private var isCleaningUp = false
+
+    // Error States für verschiedene Fehlersituationen
+    sealed class ErrorDialogState {
+        data class DeactivationError(val message: String) : ErrorDialogState()
+        object TimeoutError : ErrorDialogState()
+        data class GeneralError(val error: Exception) : ErrorDialogState()
+    }
+
+    override fun onBackPressed() {
+        lifecycleScope.launch {
+            if (viewModel.forwardingActive.first()) {  // first() sammelt den aktuellen Wert
+                viewModel.showExitDialog()  // Methode im ViewModel zum Anzeigen des Dialogs
+            } else {
+                super.onBackPressed()
+            }
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        InterfaceHolder.myInterface = this
         logger = Logger(this)
-        PhoneSmsUtils.initialize(logger) // Initialisieren Sie PhoneSmsUtils mit dem Logger
+        loggingHelper = LoggingHelper(logger)
+        InterfaceHolder.myInterface = this
+
+        PhoneSmsUtils.initialize()
 
         prefsManager = SharedPreferencesManager(this)
         viewModel = ViewModelProvider(
             this,
             ContactsViewModelFactory(application, prefsManager, logger)
         )[ContactsViewModel::class.java]
+
         permissionHandler = PermissionHandler(this)
         val requestPermissionLauncher = registerForActivityResult(
             ActivityResultContracts.RequestMultiplePermissions()
@@ -145,17 +160,49 @@ class MainActivity : ComponentActivity(), MyInterface {
         checkAndRequestPermissions()
         viewModel.loadSavedState()
         viewModel.loadOwnPhoneNumberIfEmpty(this)
-        viewModel.showOwnNumberMissingDialog.observe(this) { shouldShow ->
-            if (shouldShow) {
-                showOwnNumberMissingDialog()
-            }
-        }
+
         SmsForegroundService.startService(this)
     }
+
+    private fun checkSimStatusAndProceed() {
+        val simChecker = SimStatusChecker(this)
+        val simStatus = simChecker.checkSimStatus()
+
+        when {
+            simStatus.errorMessage != null -> {
+                showErrorAndFinish(
+                    "Fehler bei der SIM-Überprüfung",
+                    "Die SIM-Karte konnte nicht überprüft werden: ${simStatus.errorMessage}"
+                )
+            }
+
+            !simStatus.hasCellularSupport -> {
+                showErrorAndFinish(
+                    "Keine Mobilfunk-Unterstützung",
+                    "Dieses Gerät unterstützt keinen Mobilfunk. Die App kann nicht ausgeführt werden."
+                )
+            }
+
+            !simStatus.hasSimCard -> {
+                showErrorAndFinish(
+                    "Keine SIM-Karte",
+                    "Es wurde keine aktive SIM-Karte gefunden. Bitte legen Sie eine SIM-Karte ein und starten Sie die App erneut."
+                )
+            }
+
+            else -> {
+                Log.d("SimCheck", "SIM-Karte ist eingelegt und aktiv")
+                return
+            }
+        }
+    }
+
+
 
     private fun checkAndRequestPermissions() {
         permissionHandler.checkAndRequestPermissions { granted ->
             if (granted) {
+                checkSimStatusAndProceed()
                 initializeApp()
             }
         }
@@ -185,25 +232,77 @@ class MainActivity : ComponentActivity(), MyInterface {
         super.onDestroy()
     }
 
+
+    private fun showErrorAndFinish(title: String, message: String) {
+        setContent {
+            AlertDialog(
+                onDismissRequest = { /* Nicht abbrechbar */ },
+                properties = DialogProperties(
+                    dismissOnBackPress = false,
+                    dismissOnClickOutside = false
+                ),
+                title = { Text(title) },
+                text = { Text(message) },
+                confirmButton = {
+                    Button(
+                        onClick = { finish() }  // Beendet die Activity
+                    ) {
+                        Text("App beenden")
+                    }
+                }
+            )
+        }
+    }
+
+
+
+
+
+
     override fun showToast(data: String) {
 
         // Verarbeite die Daten hier
-        Toast.makeText(this, "$data", Toast.LENGTH_SHORT).show()
+        Toast.makeText(this, data, Toast.LENGTH_SHORT).show()
     }
 
     override fun addLogEntry(entry: String) {
         logger.addLogEntry(entry)
     }
 
-    // @OptIn(ExperimentalMaterial3Api::class)
+
     @Composable
     fun UI(viewModel: ContactsViewModel) {
         val navController = rememberNavController()
         val topBarTitle by viewModel.topBarTitle.collectAsState()
+        val navigationTarget by viewModel.navigationTarget.collectAsState()
+        val showExitDialog by viewModel.showExitDialog.collectAsState()
+        val showProgressDialog by viewModel.showProgressDialog.collectAsState()
+        val errorState by viewModel.errorState.collectAsState()
+        val showOwnNumberMissingDialog by viewModel.showOwnNumberMissingDialog.collectAsState()
+
+        // Cleanup Effect
+        LaunchedEffect(Unit) {
+            viewModel.cleanupCompleted.collect {
+                finish()
+            }
+        }
+
+        // Navigation Effect
+        LaunchedEffect(navigationTarget) {
+            navigationTarget?.let { target ->
+                navController.navigate(target) {
+                    launchSingleTop = true
+                    restoreState = true
+                    popUpTo(navController.graph.findStartDestination().id) {
+                        saveState = true
+                    }
+                }
+                viewModel.onNavigated()
+            }
+        }
 
         Scaffold(
             topBar = { CustomTopAppBar(title = topBarTitle) },
-
             bottomBar = { BottomNavigationBar(navController) }
         ) { innerPadding ->
             NavHost(
@@ -226,19 +325,251 @@ class MainActivity : ComponentActivity(), MyInterface {
                     InfoScreen()
                 }
             }
+            if (showOwnNumberMissingDialog) {
+                OwnNumberMissingDialog(
+                    onDismiss = { viewModel.hideOwnNumberMissingDialog() },
+                    onNavigateToSettings = {
+                        viewModel.hideOwnNumberMissingDialog()
+                        viewModel.navigateToSettings()
+                    }
+                )
+            }
+
+            // Exit Dialog
+            if (showExitDialog) {
+                val selectedContact by viewModel.selectedContact.collectAsState() // Hier collectAsState verwenden
+                ExitDialog(
+                    contact = selectedContact,
+                    onDismiss = { viewModel.hideExitDialog() },
+                    onConfirm = { keepForwarding ->
+                        viewModel.hideExitDialog()
+                        viewModel.startCleanup(keepForwarding)
+                    },
+                    onSettings = {
+                        viewModel.hideExitDialog()
+                        viewModel.navigateToSettings()
+                    }
+                )
+            }
+
+            // Progress Dialog
+            if (showProgressDialog) {
+                CleanupProgressDialog()
+            }
+
+            // Error Dialog
+            errorState?.let { error ->
+                CleanupErrorDialog(
+                    error = error,
+                    onRetry = {
+                        viewModel.clearErrorState()
+                        viewModel.startCleanup(false)
+                    },
+                    onIgnore = {
+                        viewModel.clearErrorState()
+                        finish()
+                    },
+                    onDismiss = {
+                        viewModel.clearErrorState()
+                    }
+                )
+            }
         }
     }
 
-    private fun showOwnNumberMissingDialog() {
-        AlertDialog.Builder(this)
-            .setTitle("Eigene Telefonnummer fehlt")
-            .setMessage("Bitte tragen Sie Ihre eigene Telefonnummer in den Einstellungen ein, bevor Sie eine Test-SMS versenden.")
-            .setPositiveButton("OK") { dialog, _ ->
-                dialog.dismiss()
-                viewModel.onOwnNumberMissingDialogDismissed()
+    @Composable
+    private fun OwnNumberMissingDialog(
+        onDismiss: () -> Unit,
+        onNavigateToSettings: () -> Unit
+    ) {
+        AlertDialog(
+            onDismissRequest = onDismiss,
+            icon = {
+                Icon(
+                    imageVector = Icons.Default.Info,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.primary
+                )
+            },
+            title = {
+                Text("Eigene Telefonnummer fehlt")
+            },
+            text = {
+                Text(
+                    "Bitte tragen Sie Ihre eigene Telefonnummer in den Einstellungen ein.",
+                    style = MaterialTheme.typography.bodyMedium
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = onNavigateToSettings
+                ) {
+                    Text("Zu den Einstellungen")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = onDismiss) {
+                    Text("Abbrechen")
+                }
             }
-            .show()
+        )
     }
+
+    @Composable
+    private fun ExitDialog(
+        contact: Contact?,
+        onDismiss: () -> Unit,
+        onConfirm: (Boolean) -> Unit,
+        onSettings: () -> Unit
+    ) {
+        var keepForwarding by remember { mutableStateOf(prefsManager.getKeepForwardingOnExit()) }
+
+        AlertDialog(
+            onDismissRequest = onDismiss,
+            icon = {
+                Icon(
+                    imageVector = Icons.Default.ExitToApp,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.primary
+                )
+            },
+            title = {
+                Text("App beenden")
+            },
+            text = {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 8.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    contact?.let {
+                        Text(
+                            text = "Aktive Weiterleitung zu: ${it.name}",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+
+                    if (contact != null) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Checkbox(
+                                checked = keepForwarding,
+                                onCheckedChange = {
+                                    keepForwarding = it
+                                    viewModel.updateKeepForwardingOnExit(it)
+                                }
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text(
+                                text = "Weiterleitung beim Beenden beibehalten",
+                                style = MaterialTheme.typography.bodyMedium
+                            )
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = { onConfirm(keepForwarding) }
+                ) {
+                    Text("Beenden")
+                }
+            },
+            dismissButton = {
+                Row {
+                    TextButton(onClick = onSettings) {
+                        Text("Einstellungen")
+                    }
+                    Spacer(modifier = Modifier.width(8.dp))
+                    TextButton(onClick = onDismiss) {
+                        Text("Abbrechen")
+                    }
+                }
+            }
+        )
+    }
+
+    @Composable
+    private fun CleanupProgressDialog() {
+        AlertDialog(
+            onDismissRequest = { /* Nicht abbrechbar */ },
+            properties = DialogProperties(
+                dismissOnBackPress = false,
+                dismissOnClickOutside = false
+            ),
+            title = { Text("Beende App") },
+            text = {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(16.dp),
+                    horizontalArrangement = Arrangement.spacedBy(16.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(24.dp)
+                    )
+                    Text(
+                        text = "Bitte warten...",
+                        style = MaterialTheme.typography.bodyMedium
+                    )
+                }
+            },
+            confirmButton = { /* Keine Buttons während des Cleanups */ }
+        )
+    }
+
+    @Composable
+    private fun CleanupErrorDialog(
+        error: ContactsViewModel.ErrorDialogState,
+        onRetry: () -> Unit,
+        onIgnore: () -> Unit,
+        onDismiss: () -> Unit
+    ) {
+        val (title, message) = when (error) {
+            is ContactsViewModel.ErrorDialogState.DeactivationError ->
+                Pair("Deaktivierung fehlgeschlagen", error.message)
+            is ContactsViewModel.ErrorDialogState.TimeoutError ->
+                Pair("Zeitüberschreitung", "Die Deaktivierung der Weiterleitung dauert zu lange.")
+            is ContactsViewModel.ErrorDialogState.GeneralError ->
+                Pair("Fehler", "Ein unerwarteter Fehler ist aufgetreten: ${error.error.message}")
+        }
+
+        AlertDialog(
+            onDismissRequest = onDismiss,
+            icon = {
+                Icon(
+                    imageVector = Icons.Default.Info,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.error
+                )
+            },
+            title = { Text(title) },
+            text = { Text(message) },
+            confirmButton = {
+                Button(onClick = onRetry) {
+                    Text("Wiederholen")
+                }
+            },
+            dismissButton = {
+                Row {
+                    TextButton(onClick = onIgnore) {
+                        Text("Ignorieren")
+                    }
+                    Spacer(modifier = Modifier.width(8.dp))
+                    TextButton(onClick = onDismiss) {
+                        Text("Abbrechen")
+                    }
+                }
+            }
+        )
+    }
+
+
 
     @Composable
     fun CustomTopAppBar(title: String) {
@@ -320,7 +651,7 @@ class MainActivity : ComponentActivity(), MyInterface {
         val filterText by viewModel.filterText.collectAsState()
 
         LaunchedEffect(Unit) {
-            viewModel.loadContacts(filterText)
+            viewModel.applyCurrentFilter()
         }
 
         BoxWithConstraints {
@@ -384,7 +715,7 @@ class MainActivity : ComponentActivity(), MyInterface {
                     filterText = filterText,
                     onFilterTextChange = {
                         viewModel.updateFilterText(it)
-                        viewModel.loadContacts(it)
+                        viewModel.applyCurrentFilter()
                     }
                 )
 
@@ -418,7 +749,7 @@ class MainActivity : ComponentActivity(), MyInterface {
                 filterText = filterText,
                 onFilterTextChange = {
                     viewModel.updateFilterText(it)
-                    viewModel.loadContacts(it)
+                    viewModel.applyCurrentFilter()
                 }
             )
 
@@ -466,7 +797,7 @@ class MainActivity : ComponentActivity(), MyInterface {
             TextField(
                 value = filterText,
                 onValueChange = onFilterTextChange,
-                label = { Text("Kontakt für Weiterleitung suchen") },
+                label = { Text("Filter für Kontakt") },
                 modifier = Modifier
                     .weight(1f)
                     .height(72.dp)
@@ -533,7 +864,16 @@ class MainActivity : ComponentActivity(), MyInterface {
         Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .clickable(onClick = onSelect)
+                .clickable {
+                    val ownNumber = viewModel.ownPhoneNumber.value
+
+                        if (ownNumber.isBlank()) {
+                            viewModel.showOwnNumberMissingDialog()
+                        } else {
+                            onSelect()
+
+                    }
+                }
                 .background(if (isSelected) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surface)
                 .padding(vertical = 4.dp, horizontal = 16.dp)
         ) {
@@ -542,7 +882,7 @@ class MainActivity : ComponentActivity(), MyInterface {
                 style = MaterialTheme.typography.bodyLarge
             )
             Text(
-                text = contact.phoneNumber,
+                text = contact.description,
                 style = MaterialTheme.typography.bodySmall
             )
         }
@@ -608,7 +948,6 @@ class MainActivity : ComponentActivity(), MyInterface {
         }
     }
 
-
     @Composable
     fun SettingsScreen() {
         val filterText by viewModel.filterText.collectAsState()
@@ -616,6 +955,8 @@ class MainActivity : ComponentActivity(), MyInterface {
         val testSmsText by viewModel.testSmsText.collectAsState()
         val ownPhoneNumber by viewModel.ownPhoneNumber.collectAsState()
         val topBarTitle by viewModel.topBarTitle.collectAsState()
+        val countryCode by viewModel.countryCode.collectAsState()
+        val countryCodeSource by viewModel.countryCodeSource.collectAsState()
         val context = LocalContext.current
         val scrollState = rememberScrollState()
         val focusManager = LocalFocusManager.current
@@ -698,7 +1039,8 @@ class MainActivity : ComponentActivity(), MyInterface {
                     Spacer(modifier = Modifier.width(8.dp))
                     IconButton(
                         onClick = {
-                            getPhoneNumber(context, viewModel::updateOwnPhoneNumber)                       }
+                            getPhoneNumber(context, viewModel::updateOwnPhoneNumber)
+                        }
                     ) {
                         Icon(
                             imageVector = Icons.Default.Search,
@@ -712,7 +1054,7 @@ class MainActivity : ComponentActivity(), MyInterface {
                 TextField(
                     value = topBarTitle,
                     onValueChange = { viewModel.updateTopBarTitle(it) },
-                    label = { Text("TopBar Titel") },
+                    label = { Text("App Titel") },
                     modifier = Modifier
                         .fillMaxWidth()
                         .onFocusChanged { isTopBarTitleFocused = it.isFocused }
@@ -729,23 +1071,86 @@ class MainActivity : ComponentActivity(), MyInterface {
                         onCheckedChange = null,
                         enabled = false
                     )
-                    Text("Weiterleitung aktiv",
-                        color = Color.Gray)
-                }
+                    Text(
+                        "Weiterleitung aktiv",
+                        color = Color.Gray
+                    )
 
-                // Zusätzlicher Platz am Ende
-                Spacer(modifier = Modifier.height(100.dp))
+
+                }
+                Spacer(modifier = Modifier.height(16.dp))
+
+//                TextField(
+//                    value = PhoneSmsUtils.getCountryNameForCode(countryCode),
+//                    onValueChange = { /* Keine Änderung möglich */ },
+//                    label = { Text("Erkannte Ländervorwahl") },
+//                    modifier = Modifier
+//                        .fillMaxWidth()
+//                        .padding(bottom = 16.dp),
+//                    enabled = false,
+//                    colors = TextFieldDefaults.colors(
+//                        disabledTextColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.8f),
+//                        disabledContainerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.3f),
+//                        disabledLabelColor = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.8f),
+//                        disabledPlaceholderColor = MaterialTheme.colorScheme.onSurfaceVariant.copy(
+//                            alpha = 0.4f
+//                        ),
+//                        disabledLeadingIconColor = MaterialTheme.colorScheme.onSurfaceVariant.copy(
+//                            alpha = 0.4f
+//                        ),
+//                        disabledTrailingIconColor = MaterialTheme.colorScheme.onSurfaceVariant.copy(
+//                            alpha = 0.4f
+//                        )
+//                    ),
+//                    readOnly = true
+//                )
+//
+//                // Zusätzlicher Platz am Ende
+//                Spacer(modifier = Modifier.height(100.dp))
+
+
+                // Ländervorwahl-Anzeige
+                Column {
+                    Text(
+                        text = "Erkannte Ländervorwahl",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Surface(
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = MaterialTheme.shapes.small,
+                        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.3f)
+                    ) {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(16.dp)
+                        ) {
+                            Text(
+                                text = PhoneSmsUtils.getCountryNameForCode(countryCode),
+                                style = MaterialTheme.typography.bodyLarge,
+                                color = MaterialTheme.colorScheme.onSurface
+                            )
+                            Spacer(modifier = Modifier.height(4.dp))
+                            Text(
+                                text = "Quelle: $countryCodeSource",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
+                }
             }
         }
     }
-
 
     private fun getPhoneNumber(context: Context, callback: (String) -> Unit) {
         // Überprüfen Sie zuerst die Berechtigung
         permissionHandler.checkAndRequestPermissions { granted ->
             if (granted) {
                 // Wenn die Berechtigung erteilt wurde, versuchen Sie, die Nummer abzurufen
-                val number = PhoneSmsUtils.getSimCardNumber(context)
+                val number = PhoneSmsUtils.getSimCardNumber(context, logger)
                 callback(number)
             } else {
                 // Wenn die Berechtigung nicht erteilt wurde, informieren Sie den Benutzer
@@ -759,15 +1164,12 @@ class MainActivity : ComponentActivity(), MyInterface {
         }
     }
 
-
     @Composable
     fun LogScreen() {
         val context = LocalContext.current
-        //val configuration = LocalConfiguration.current
         val logEntriesHtml by viewModel.logEntriesHtml.collectAsState()
         val logEntries by viewModel.logEntries.collectAsState()
 
-        // Laden der Logs beim Aufrufen des Screens
         LaunchedEffect(Unit) {
             viewModel.reloadLogs()
         }
@@ -776,16 +1178,14 @@ class MainActivity : ComponentActivity(), MyInterface {
             val isLandscape = maxWidth > maxHeight
 
             if (isLandscape) {
-                // Landscape layout
                 Row(
                     modifier = Modifier
                         .fillMaxSize()
                         .padding(16.dp)
                 ) {
-                    // Left column: Log table
                     Box(
                         modifier = Modifier
-                            .weight(2f)
+                            .weight(1f)
                             .fillMaxHeight()
                     ) {
                         LogTable(logEntriesHtml)
@@ -793,17 +1193,17 @@ class MainActivity : ComponentActivity(), MyInterface {
 
                     Spacer(modifier = Modifier.width(16.dp))
 
-                    // Right column: Controls
+                    // Icon-Spalte ohne weight, nur mit der benötigten Breite
                     Column(
                         modifier = Modifier
-                            .weight(1f)
-                            .fillMaxHeight(),
+                            .fillMaxHeight()
+                            .padding(8.dp),
                         verticalArrangement = Arrangement.Top,
                         horizontalAlignment = Alignment.CenterHorizontally
                     ) {
-                        Row(
-                            horizontalArrangement = Arrangement.spacedBy(8.dp),
-                            verticalAlignment = Alignment.CenterVertically
+                        Column(
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            verticalArrangement = Arrangement.spacedBy(16.dp)
                         ) {
                             ShareLogIconButton(context, logEntries)
                             DeleteLogIconButton(context)
@@ -812,7 +1212,6 @@ class MainActivity : ComponentActivity(), MyInterface {
                     }
                 }
             } else {
-                // Portrait layout
                 Column(
                     modifier = Modifier
                         .fillMaxSize()
@@ -841,20 +1240,6 @@ class MainActivity : ComponentActivity(), MyInterface {
     }
 
     @Composable
-    fun RefreshLogButton(viewModel: ContactsViewModel) {
-        IconButton(
-            onClick = {
-                viewModel.reloadLogs()
-            }
-        ) {
-            Icon(
-                imageVector = Icons.Default.Refresh,
-                contentDescription = "Logs aktualisieren"
-            )
-        }
-    }
-
-    @Composable
     fun LogTable(logEntriesHtml: String) {
         if (logEntriesHtml.isEmpty()) {
             Text("Keine Log-Einträge vorhanden oder Fehler beim Laden der Logs.")
@@ -871,106 +1256,111 @@ class MainActivity : ComponentActivity(), MyInterface {
                                 super.onReceivedError(view, request, error)
                                 logger.addLogEntry("WebView-Fehler: ${error?.description}")
                             }
-
-                            override fun onPageFinished(view: WebView?, url: String?) {
-                                super.onPageFinished(view, url)
-                                logger.addLogEntry("WebView Seite geladen")
-                            }
                         }
                         settings.apply {
-                            javaScriptEnabled = true
+                            javaScriptEnabled = false
                             loadWithOverviewMode = true
                             useWideViewPort = true
                             builtInZoomControls = true
                             displayZoomControls = false
                             setSupportZoom(true)
                         }
+
+                        // Inject CSS for improved table styling
+                        val css = """
+                        <style>
+                            body {
+                                margin: 0;
+                                padding: 8px;
+                                font-family: sans-serif;
+                            }
+                            .log-table {
+                                width: 100%;
+                                border-collapse: collapse;
+                                table-layout: fixed;
+                            }
+                            .log-table th {
+                                background-color: #f0f0f0;
+                                position: sticky;
+                                top: 0;
+                                z-index: 1;
+                                padding: 8px;
+                                text-align: left;
+                                border: 1px solid #ddd;
+                            }
+                            .log-table td {
+                                padding: 8px;
+                                border: 1px solid #ddd;
+                                vertical-align: top;
+                            }
+                            .log-table .time-col {
+                                width: 75px;
+                                white-space: nowrap;
+                            }
+                            .log-table .type-col {
+                                width: 60px;
+                                white-space: nowrap;
+                            }
+                            .log-table .entry-col {
+                                word-wrap: break-word;
+                                white-space: pre-wrap;
+                            }
+                            @media (prefers-color-scheme: dark) {
+                                body {
+                                    background-color: #121212;
+                                    color: #ffffff;
+                                }
+                                .log-table th {
+                                    background-color: #1e1e1e;
+                                    border-color: #333;
+                                }
+                                .log-table td {
+                                    border-color: #333;
+                                }
+                            }
+                        </style>
+                    """.trimIndent()
+
+                        // Modify the log entries HTML to include the new CSS and table classes
+                        val modifiedHtml = logEntriesHtml.replace(
+                            "<table",
+                            "$css<table class=\"log-table\""
+                        ).replace(
+                            "<td>",
+                            "<td class=\"entry-col\">"
+                        )
+
+                        loadDataWithBaseURL(null, modifiedHtml, "text/html", "UTF-8", null)
                     }
                 },
                 update = { webView ->
-                    webView.loadDataWithBaseURL(null, logEntriesHtml, "text/html", "UTF-8", null)
+                    val modifiedHtml = logEntriesHtml.replace(
+                        "<table",
+                        "<table class=\"log-table\""
+                    ).replace(
+                        "<td>",
+                        "<td class=\"entry-col\">"
+                    )
+                    webView.loadDataWithBaseURL(null, modifiedHtml, "text/html", "UTF-8", null)
                 },
                 modifier = Modifier.fillMaxSize()
             )
         }
     }
 
-//    @OptIn(ExperimentalMaterial3Api::class)
-//    @Composable
-//    fun ShareLogIconButton(context: Context, logEntries: String) {
-//        val tooltipState = rememberTooltipState()
-//        TooltipBox(
-//            positionProvider = TooltipDefaults.rememberPlainTooltipPositionProvider(),
-//            tooltip = {
-//                PlainTooltip {
-//                    Text("Log-Einträge teilen")
-//                }
-//            },
-//            state = tooltipState,
-//            content = {
-//                IconButton(
-//                    onClick = {
-//                        if (logEntries.isNotEmpty()) {
-//                            val shareIntent = Intent().apply {
-//                                action = Intent.ACTION_SEND
-//                                putExtra(Intent.EXTRA_TEXT, logEntries)
-//                                type = "text/plain"
-//                            }
-//                            context.startActivity(
-//                                Intent.createChooser(
-//                                    shareIntent,
-//                                    "Log-Einträge teilen"
-//                                )
-//                            )
-//                        } else {
-//                            Toast.makeText(
-//                                context,
-//                                "Keine Log-Einträge zum Teilen vorhanden",
-//                                Toast.LENGTH_SHORT
-//                            ).show()
-//                        }
-//                    }
-//                ) {
-//                    Icon(
-//                        imageVector = Icons.Filled.Share,
-//                        contentDescription = "Log-Einträge teilen"
-//                    )
-//                }
-//            }
-//        )
-//    }
-//
-//    @OptIn(ExperimentalMaterial3Api::class)
-//    @Composable
-//    fun DeleteLogIconButton(context: Context) {
-//        val tooltipState = rememberTooltipState()
-//        TooltipBox(
-//            positionProvider = TooltipDefaults.rememberPlainTooltipPositionProvider(),
-//            tooltip = {
-//                PlainTooltip {
-//                    Text("Log löschen")
-//                }
-//            },
-//            state = tooltipState,
-//            content = {
-//                IconButton(
-//                    onClick = {
-//                        logger.clearLog()
-//                        Toast.makeText(
-//                            context,
-//                            "Log-Löschen-Funktion",
-//                            Toast.LENGTH_SHORT
-//                        ).show()
-//                    }
-//                ) {
-//                    Icon(
-//                        imageVector = Icons.Filled.Delete,
-//                        contentDescription = "Log löschen"
-//                    )
-//                }
-//            }
-//        )
-//    }
+    @Composable
+    fun RefreshLogButton(viewModel: ContactsViewModel) {
+        IconButton(
+            onClick = {
+                viewModel.reloadLogs()
+            }
+        ) {
+            Icon(
+                imageVector = Icons.Default.Refresh,
+                contentDescription = "Logs aktualisieren"
+            )
+        }
+    }
 
     @Composable
     fun ShareLogIconButton(context: Context, logEntries: String) {
@@ -1023,14 +1413,14 @@ class MainActivity : ComponentActivity(), MyInterface {
         }
     }
 
-
     @Composable
     fun InfoScreen() {
         val scrollState = rememberScrollState()
         val context = LocalContext.current
         val isDarkTheme = MaterialTheme.colorScheme.background.luminance() < 0.5
         val packageInfo = remember {
-            context.packageManager.getPackageInfo(context.packageName, 0)}
+            context.packageManager.getPackageInfo(context.packageName, 0)
+        }
         Column(
             modifier = Modifier
                 .fillMaxSize()
@@ -1103,7 +1493,7 @@ class MainActivity : ComponentActivity(), MyInterface {
                         // Lade den HTML-Inhalt
                         loadDataWithBaseURL(
                             null,
-                            getHtmlContent(isDarkTheme),
+                            getHtmlContent(isDarkTheme, context),
                             "text/html",
                             "UTF-8",
                             null
@@ -1114,7 +1504,7 @@ class MainActivity : ComponentActivity(), MyInterface {
                     // Aktualisiere die WebView, wenn sich das Theme ändert
                     webView.loadDataWithBaseURL(
                         null,
-                        getHtmlContent(isDarkTheme),
+                        getHtmlContent(isDarkTheme, context),
                         "text/html",
                         "UTF-8",
                         null
@@ -1125,9 +1515,15 @@ class MainActivity : ComponentActivity(), MyInterface {
         }
     }
 
-    private fun getHtmlContent(isDarkTheme: Boolean): String {
+    private fun getHtmlContent(isDarkTheme: Boolean, context: Context): String {
         val backgroundColor = if (isDarkTheme) "#121212" else "#FFFFFF"
         val textColor = if (isDarkTheme) "#E0E0E0" else "#333333"
+
+        // Ermittle Android-Versionsdetails
+        val currentAndroidVersion = Build.VERSION.RELEASE
+        val currentSDKVersion = Build.VERSION.SDK_INT
+        val minSDKVersion = context.applicationInfo.minSdkVersion
+        val targetSDKVersion = context.applicationInfo.targetSdkVersion
 
         return """
     <!DOCTYPE html>
@@ -1135,7 +1531,6 @@ class MainActivity : ComponentActivity(), MyInterface {
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>App Beschreibung</title>
         <style>
             body {
                 font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen-Sans, Ubuntu, Cantarell, 'Helvetica Neue', sans-serif;
@@ -1150,50 +1545,185 @@ class MainActivity : ComponentActivity(), MyInterface {
                 font-size: 16px;
                 margin-top: 20px;
                 margin-bottom: 10px;
+                color: ${if (isDarkTheme) "#E0E0E0" else "#333333"};
             }
-            ul, ol {
-                padding-left: 20px;
+            .section-container {
+                background-color: ${if (isDarkTheme) "#1E1E1E" else "#F5F5F5"};
+                border-radius: 8px;
+                padding: 16px;
+                margin-bottom: 16px;
             }
-            li {
-                margin-bottom: 5px;
+            .info-grid {
+                display: grid;
+                grid-template-columns: auto 1fr;
+                gap: 8px;
+                align-items: baseline;
+            }
+            .info-label {
+                font-weight: 500;
+                color: ${if (isDarkTheme) "#9E9E9E" else "#666666"};
+                padding-right: 16px;
+            }
+            .info-value {
+                color: ${if (isDarkTheme) "#E0E0E0" else "#333333"};
+            }
+            .badge {
+                display: inline-block;
+                padding: 2px 8px;
+                border-radius: 4px;
+                font-size: 12px;
+                background-color: ${if (isDarkTheme) "#333333" else "#E0E0E0"};
+                color: ${if (isDarkTheme) "#E0E0E0" else "#333333"};
+            }
+            .subsection {
+                margin-top: 16px;
+                padding-top: 12px;
+                border-top: 1px solid ${if (isDarkTheme) "#333333" else "#E0E0E0"};
+            }
+            .feature-list {
+                list-style-type: none;
+                padding: 0;
+                margin: 0;
+            }
+            .feature-item {
+                margin-bottom: 16px;
+            }
+            .feature-title {
+                font-weight: 600;
+                color: ${if (isDarkTheme) "#E0E0E0" else "#333333"};
+                margin-bottom: 4px;
+            }
+            .feature-description {
+                color: ${if (isDarkTheme) "#B0B0B0" else "#666666"};
+                margin-left: 16px;
+            }
+            .footnote {
+                font-style: italic;
+                margin-top: 16px;
+                color: ${if (isDarkTheme) "#9E9E9E" else "#666666"};
             }
         </style>
     </head>
     <body>
-        <h2>Funktionsweise und Techniken</h2>
-        <p>Diese App ermöglicht die Weiterleitung von eingehenden SMS und Telefonanrufen an eine von Ihnen gewählte Nummer. Hier sind einige Details zur Funktionsweise:</p>
-        
-        <ul>
-            <li><strong>SMS-Weiterleitung:</strong> Verwendet einen BroadcastReceiver, der eingehende SMS abfängt und über einen WorkManager asynchron weiterleitet.</li>
-            <li><strong>Anrufweiterleitung:</strong> Nutzt USSD-Codes, um die native Anrufweiterleitungsfunktion des Telefons zu aktivieren.</li>
-            <li><strong>Benutzeroberfläche:</strong> Entwickelt mit Jetpack Compose für eine moderne, reaktive UI.</li>
-            <li><strong>Datenspeicherung:</strong> Verwendet Encrypted SharedPreferences zur Speicherung von Benutzereinstellungen.</li>
-            <li><strong>Hintergrunddienst:</strong> Ein Foreground Service sorgt für zuverlässigen Betrieb auch bei App-Inaktivität.</li>
-            <li><strong>Berechtigungshandling:</strong> Implementiert dynamische Berechtigungsanfragen für Android 10.0+.</li>
-        </ul>
+        <div class="section-container">
+            <h2>Hauptfunktionen</h2>
+            <ul class="feature-list">
+                <li class="feature-item">
+                    <div class="feature-title">Kontaktauswahl und Management</div>
+                    <div class="feature-description">
+                        Wählen Sie einfach einen Kontakt aus Ihrer Kontaktliste aus, an den SMS und Anrufe weitergeleitet werden sollen.
+                        Die App speichert Ihre Auswahl und ermöglicht es Ihnen, den Weiterleitungskontakt jederzeit zu ändern.
+                    </div>
+                </li>
+                
+                <li class="feature-item">
+                    <div class="feature-title">SMS-Weiterleitung</div>
+                    <div class="feature-description">
+                        Alle eingehenden SMS werden automatisch und in Echtzeit an die von Ihnen gewählte Nummer weitergeleitet.
+                        Der ursprüngliche Absender und der komplette Nachrichteninhalt bleiben dabei erhalten.
+                        Die Weiterleitung erfolgt auch bei ausgeschaltetem Bildschirm zuverlässig im Hintergrund.
+                    </div>
+                </li>
+                
+                <li class="feature-item">
+                    <div class="feature-title">Anrufweiterleitung</div>
+                    <div class="feature-description">
+                        Eingehende Anrufe werden automatisch an Ihre gewählte Nummer umgeleitet.
+                        Die App nutzt dafür die native Weiterleitungsfunktion Ihres Telefons, was maximale Kompatibilität
+                        und Zuverlässigkeit gewährleistet. Die Weiterleitung kann jederzeit aktiviert oder deaktiviert werden.
+                    </div>
+                </li>
+                
+                <li class="feature-item">
+                    <div class="feature-title">Test-Funktionen</div>
+                    <div class="feature-description">
+                        Testen Sie die Weiterleitung mit einer Test-SMS, um sicherzustellen, dass alles korrekt eingerichtet ist.
+                        Der Inhalt der Test-SMS kann in den Einstellungen angepasst werden.
+                    </div>
+                </li>
+                
+                <li class="feature-item">
+                    <div class="feature-title">Umfangreiche Protokollierung</div>
+                    <div class="feature-description">
+                        Alle Weiterleitungsaktivitäten werden detailliert protokolliert. Sie können jederzeit nachvollziehen,
+                        welche SMS und Anrufe weitergeleitet wurden. Das Protokoll kann geteilt oder exportiert werden,
+                        was bei der Fehlersuche sehr hilfreich sein kann.
+                    </div>
+                </li>
+            </ul>
+        </div>
 
-        <h2>Hauptfunktionen</h2>
-        <ol>
-            <li><strong>Kontaktauswahl:</strong> Wählen Sie einen Kontakt aus Ihrer Kontaktliste für die Weiterleitung.</li>
-            <li><strong>SMS-Weiterleitung:</strong> Automatische Weiterleitung eingehender SMS an die gewählte Nummer.</li>
-            <li><strong>Anrufweiterleitung:</strong> Aktivierung der Anrufweiterleitung über USSD-Codes.</li>
-            <li><strong>Test-SMS:</strong> Senden Sie eine Test-SMS, um die Weiterleitung zu überprüfen.</li>
-            <li><strong>Protokollierung:</strong> Alle Weiterleitungsaktivitäten werden in einem Logbuch festgehalten.</li>
-        </ol>
+        <div class="section-container">
+            <h2>System-Information</h2>
+            <div class="info-grid">
+                <span class="info-label">Programmiersprache:</span>
+                <span class="info-value">Kotlin ${BuildConfig.KOTLIN_VERSION}</span>
+                
+                <span class="info-label">UI-Framework:</span>
+                <span class="info-value">Jetpack Compose </span>
+                
+                <span class="info-label">Build-System:</span>
+                <span class="info-value">Gradle ${BuildConfig.GRADLE_VERSION} mit AGP ${BuildConfig.AGP_VERSION}</span>
+                                    
+                <span class="info-label">Build Tools:</span>
+                <span class="info-value">${BuildConfig.BUILD_TOOLS_VERSION}</span>
 
-        <h2>Technische Details</h2>
-        <ul>
-            <li><strong>Programmiersprache:</strong> Kotlin</li>
-            <li><strong>UI-Framework:</strong> Jetpack Compose</li>
-            <li><strong>Nebenläufigkeit:</strong> Coroutines und Flow für asynchrone Operationen</li>
-            <li><strong>Architektur:</strong> MVVM (Model-View-ViewModel) mit Repository-Pattern</li>
-            <li><strong>Dependency Injection:</strong> Koin (leichtgewichtige DI-Lösung)</li>
-        </ul>
+                <span class="info-label">Build Zeitpunkt:</span>
+                <span class="info-value">${BuildConfig.BUILD_TIME}</span>
+                
+                <span class="info-label">Build Typ:</span>
+                <span class="info-value"><span class="badge">${BuildConfig.BUILD_TYPE}</span></span>
+                                
+                <span class="info-label">Architektur:</span>
+                <span class="info-value">MVVM (Model-View-ViewModel) mit Repository-Pattern</span>
+                
+                <span class="info-label">Nebenläufigkeit:</span>
+                <span class="info-value">Coroutines und Flow</span>
+                
+                <span class="info-label">Datenspeicherung:</span>
+                <span class="info-value">Verschlüsselte SharedPreferences</span>
+                
+                <span class="info-label">Hintergrunddienst:</span>
+                <span class="info-value">Foreground Service</span>
+                
+                <span class="info-label">Android Version:</span>
+                <span class="info-value">Android $currentAndroidVersion (API Level $currentSDKVersion)</span>
+                
+                <span class="info-label">Min SDK:</span>
+                <span class="info-value">Android ${getAndroidVersionName(minSDKVersion)} (API Level $minSDKVersion)</span>
+                
+                <span class="info-label">Target SDK:</span>
+                <span class="info-value">Android ${getAndroidVersionName(targetSDKVersion)} (API Level $targetSDKVersion)</span>
 
-        <p>Die App wurde unter Berücksichtigung moderner Android-Entwicklungspraktiken und Datenschutzrichtlinien entwickelt. Sie benötigt bestimmte Berechtigungen, um ordnungsgemäß zu funktionieren, und arbeitet im Hintergrund, um eine zuverlässige Weiterleitung zu gewährleisten.</p>
+                <span class="info-label">JDK:</span>
+                <span class="info-value">${BuildConfig.JDK_VERSION}</span>
+ 
+            </div>
+        </div>
+
+        <p class="footnote">
+            Die App wurde unter Berücksichtigung moderner Android-Entwicklungspraktiken und Datenschutzrichtlinien entwickelt. 
+            Sie läuft energieeffizient im Hintergrund und gewährleistet dabei eine zuverlässige Weiterleitung Ihrer Nachrichten und Anrufe.
+        </p>
     </body>
     </html>
     """.trimIndent()
-    }}
+    }
+}
 
-
+// Hilfsfunktion um API Level in Android-Versionsnamen umzuwandeln
+private fun getAndroidVersionName(sdkInt: Int): String {
+    return when (sdkInt) {
+        Build.VERSION_CODES.S_V2 -> "12L/12.1"
+        Build.VERSION_CODES.S -> "12"
+        Build.VERSION_CODES.R -> "11"
+        Build.VERSION_CODES.Q -> "10"
+        Build.VERSION_CODES.P -> "9"
+        Build.VERSION_CODES.O_MR1 -> "8.1"
+        Build.VERSION_CODES.O -> "8.0"
+        Build.VERSION_CODES.N_MR1 -> "7.1"
+        Build.VERSION_CODES.N -> "7.0"
+        Build.VERSION_CODES.M -> "6.0"
+        else -> "Version $sdkInt"
+    }
+}
