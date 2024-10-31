@@ -61,7 +61,6 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TextField
-import androidx.compose.material3.TextFieldDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -98,9 +97,9 @@ import androidx.compose.ui.window.DialogProperties
 import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
-import android.app.AlertDialog
-import android.content.DialogInterface
-
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.tween
 object InterfaceHolder {
     var myInterface: MyInterface? = null
 }
@@ -650,9 +649,9 @@ class MainActivity : ComponentActivity(), MyInterface {
         val forwardingActive by viewModel.forwardingActive.collectAsState()
         val filterText by viewModel.filterText.collectAsState()
 
-        LaunchedEffect(Unit) {
-            viewModel.applyCurrentFilter()
-        }
+//        LaunchedEffect(Unit) {
+//            viewModel.applyCurrentFilter()
+//        }
 
         BoxWithConstraints {
             val isLandscape = maxWidth > maxHeight
@@ -715,7 +714,7 @@ class MainActivity : ComponentActivity(), MyInterface {
                     filterText = filterText,
                     onFilterTextChange = {
                         viewModel.updateFilterText(it)
-                        viewModel.applyCurrentFilter()
+                        //viewModel.applyCurrentFilter()
                     }
                 )
 
@@ -749,7 +748,7 @@ class MainActivity : ComponentActivity(), MyInterface {
                 filterText = filterText,
                 onFilterTextChange = {
                     viewModel.updateFilterText(it)
-                    viewModel.applyCurrentFilter()
+ //                   viewModel.applyCurrentFilter()
                 }
             )
 
@@ -778,11 +777,26 @@ class MainActivity : ComponentActivity(), MyInterface {
 
     @Composable
     fun FilterAndLogo(filterText: String, onFilterTextChange: (String) -> Unit) {
+        val rotation = remember { Animatable(0f) }
+
+        LaunchedEffect(Unit) {
+            rotation.animateTo(
+                targetValue = 360f,
+                animationSpec = tween(
+                    durationMillis = 2000,
+                    easing = LinearEasing
+                )
+            )
+        }
+
         Row(verticalAlignment = Alignment.CenterVertically) {
             Box(
                 modifier = Modifier
                     .size(72.dp)
                     .clip(RectangleShape)
+                    .graphicsLayer {
+                        rotationZ = rotation.value
+                    }
             ) {
                 Image(
                     painter = painterResource(id = R.drawable.logofwd),
@@ -810,7 +824,6 @@ class MainActivity : ComponentActivity(), MyInterface {
             }
         }
     }
-
     @Composable
     fun ContactListBox(
         contacts: List<Contact>,
