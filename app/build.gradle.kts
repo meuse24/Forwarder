@@ -10,6 +10,15 @@ plugins {
 }
 
 android {
+
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_11
+        targetCompatibility = JavaVersion.VERSION_11
+    }
+    kotlinOptions {
+        jvmTarget = "11"
+    }
+
     buildFeatures {
         compose = true
         buildConfig = true  // Hier hinzufügen
@@ -114,6 +123,7 @@ dependencies {
     implementation(libs.androidx.security.crypto)
     implementation(libs.libphonenumber)
     implementation(libs.androidx.espresso.core)
+    implementation(libs.material)
 
     testImplementation(libs.junit)
 
@@ -123,6 +133,8 @@ dependencies {
     androidTestImplementation(libs.androidx.ui.test.junit4)
     debugImplementation(libs.androidx.ui.tooling)
     debugImplementation(libs.androidx.ui.test.manifest)
+
+
 }
 
 

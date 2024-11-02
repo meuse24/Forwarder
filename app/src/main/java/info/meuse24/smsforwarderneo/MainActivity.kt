@@ -3,6 +3,7 @@ package info.meuse24.smsforwarderneo
 
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.content.res.Configuration
 import android.os.Build
 import android.os.Bundle
@@ -11,10 +12,13 @@ import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
 import android.webkit.WebView
 import android.webkit.WebViewClient
-import android.widget.Toast
 import androidx.activity.ComponentActivity
+import androidx.activity.OnBackPressedCallback
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -28,6 +32,7 @@ import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -37,16 +42,17 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ExitToApp
 import androidx.compose.material.icons.automirrored.filled.List
 import androidx.compose.material.icons.filled.Clear
 import androidx.compose.material.icons.filled.Delete
-import androidx.compose.material.icons.filled.ExitToApp
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Share
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
@@ -57,6 +63,8 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -67,6 +75,7 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -84,61 +93,32 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.compose.ui.window.DialogProperties
 import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.lifecycleScope
 import androidx.navigation.NavController
 import androidx.navigation.NavGraph.Companion.findStartDestination
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
-import java.util.Locale
-import androidx.compose.material3.AlertDialog
-import androidx.compose.ui.window.DialogProperties
-import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
-import androidx.compose.animation.core.Animatable
-import androidx.compose.animation.core.LinearEasing
-import androidx.compose.animation.core.tween
-object InterfaceHolder {
-    var myInterface: MyInterface? = null
-}
+import java.util.Locale
 
-interface MyInterface {
-    fun showToast(data: String)
-    fun addLogEntry(entry: String)
-}
 
-class MainActivity : ComponentActivity(), MyInterface {
+class MainActivity : ComponentActivity() {
     private lateinit var permissionHandler: PermissionHandler
     private lateinit var viewModel: ContactsViewModel
     private lateinit var logger: Logger
     private lateinit var prefsManager: SharedPreferencesManager
-    private lateinit var loggingHelper: LoggingHelper
-    private var isCleaningUp = false
 
-    // Error States für verschiedene Fehlersituationen
-    sealed class ErrorDialogState {
-        data class DeactivationError(val message: String) : ErrorDialogState()
-        object TimeoutError : ErrorDialogState()
-        data class GeneralError(val error: Exception) : ErrorDialogState()
-    }
 
-    override fun onBackPressed() {
-        lifecycleScope.launch {
-            if (viewModel.forwardingActive.first()) {  // first() sammelt den aktuellen Wert
-                viewModel.showExitDialog()  // Methode im ViewModel zum Anzeigen des Dialogs
-            } else {
-                super.onBackPressed()
-            }
-        }
-    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        logger = Logger(this)
-        loggingHelper = LoggingHelper(logger)
-        InterfaceHolder.myInterface = this
+
+                logger = (applicationContext as SmsForwarderApplication).logger
 
         PhoneSmsUtils.initialize()
 
@@ -159,7 +139,18 @@ class MainActivity : ComponentActivity(), MyInterface {
         checkAndRequestPermissions()
         viewModel.loadSavedState()
         viewModel.loadOwnPhoneNumberIfEmpty(this)
-
+        onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
+            override fun handleOnBackPressed() {
+                lifecycleScope.launch {
+                    if (viewModel.forwardingActive.first()) {  // first() sammelt den aktuellen Wert
+                        viewModel.showExitDialog()  // Zeige Dialog beim Beenden mit aktiver Weiterleitung
+                    } else {
+                        isEnabled = false  // Deaktiviere den Callback
+                        onBackPressedDispatcher.onBackPressed() // Standard-Verhalten ausführen
+                    }
+                }
+            }
+        })
         SmsForegroundService.startService(this)
     }
 
@@ -196,13 +187,30 @@ class MainActivity : ComponentActivity(), MyInterface {
         }
     }
 
-
-
     private fun checkAndRequestPermissions() {
         permissionHandler.checkAndRequestPermissions { granted ->
             if (granted) {
+                LoggingManager.logInfo(
+                    component = "MainActivity",
+                    action = "PERMISSIONS_CHECK",
+                    message = "Alle erforderlichen Berechtigungen wurden gewährt",
+                    details = mapOf(
+                        "permissions" to permissionHandler.requiredPermissions.joinToString()
+                    )
+                )
                 checkSimStatusAndProceed()
                 initializeApp()
+            } else {
+                LoggingManager.logWarning(
+                    component = "MainActivity",
+                    action = "PERMISSIONS_CHECK",
+                    message = "Nicht alle Berechtigungen wurden gewährt",
+                    details = mapOf(
+                        "missingPermissions" to permissionHandler.requiredPermissions.filter {
+                            checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED
+                        }.joinToString()
+                    )
+                )
             }
         }
     }
@@ -217,8 +225,16 @@ class MainActivity : ComponentActivity(), MyInterface {
 
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
-        logger.addLogEntry("Bildschirmausrichtung wurde geändert.")
-        // Explizit den Zustand speichern und wiederherstellen
+        LoggingManager.logInfo(
+            component = "MainActivity",
+            action = "CONFIG_CHANGED",
+            message = "Bildschirmausrichtung wurde geändert",
+            details = mapOf(
+                "orientation" to if (resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE) "landscape" else "portrait",
+                "screenWidthDp" to resources.configuration.screenWidthDp,
+                "screenHeightDp" to resources.configuration.screenHeightDp
+            )
+        )    // Explizit den Zustand speichern und wiederherstellen
         viewModel.saveCurrentState()
         viewModel.loadSavedState()
     }
@@ -226,13 +242,29 @@ class MainActivity : ComponentActivity(), MyInterface {
     override fun onDestroy() {
         //viewModel.deactivateForwarding()
         viewModel.saveCurrentState() // Neue Methode, die wir im ViewModel hinzufügen werden
-        logger.addLogEntry("App wurde beendet.")
+        LoggingManager.logInfo(
+            component = "MainActivity",
+            action = "DESTROY",
+            message = "App wird beendet",
+            details = mapOf(
+                "forwardingActive" to viewModel.forwardingActive.value,
+                "timestamp" to System.currentTimeMillis()
+            )
+        )
         SmsForegroundService.stopService(this)
+
         super.onDestroy()
     }
 
-
     private fun showErrorAndFinish(title: String, message: String) {
+        LoggingManager.logError(
+            component = "MainActivity",
+            action = "SHOW_ERROR",
+            message = "Kritischer Fehler: $title - $message",
+            details = mapOf(
+                "errorTitle" to title,
+                "errorMessage" to message  )
+        )
         setContent {
             AlertDialog(
                 onDismissRequest = { /* Nicht abbrechbar */ },
@@ -253,21 +285,15 @@ class MainActivity : ComponentActivity(), MyInterface {
         }
     }
 
-
-
-
-
-
-    override fun showToast(data: String) {
-
-        // Verarbeite die Daten hier
-        Toast.makeText(this, data, Toast.LENGTH_SHORT).show()
-    }
-
-    override fun addLogEntry(entry: String) {
-        logger.addLogEntry(entry)
-    }
-
+//    override fun onBackPressed() {
+//        lifecycleScope.launch {
+//            if (viewModel.forwardingActive.first()) {  // first() sammelt den aktuellen Wert
+//                viewModel.showExitDialog()  // Methode im ViewModel zum Anzeigen des Dialogs
+//            } else {
+//                super.onBackPressed()
+//            }
+//        }
+//    }
 
     @Composable
     fun UI(viewModel: ContactsViewModel) {
@@ -278,12 +304,19 @@ class MainActivity : ComponentActivity(), MyInterface {
         val showProgressDialog by viewModel.showProgressDialog.collectAsState()
         val errorState by viewModel.errorState.collectAsState()
         val showOwnNumberMissingDialog by viewModel.showOwnNumberMissingDialog.collectAsState()
+        val snackbarHostState = remember { SnackbarHostState() }
+        val coroutineScope = rememberCoroutineScope()
 
         // Cleanup Effect
         LaunchedEffect(Unit) {
             viewModel.cleanupCompleted.collect {
                 finish()
             }
+        }
+
+        // Initialisieren Sie den SnackbarManager mit dem State und Scope
+        LaunchedEffect(snackbarHostState, coroutineScope) {
+            SnackbarManager.setSnackbarState(snackbarHostState, coroutineScope)
         }
 
         // Navigation Effect
@@ -300,29 +333,45 @@ class MainActivity : ComponentActivity(), MyInterface {
             }
         }
 
-        Scaffold(
-            topBar = { CustomTopAppBar(title = topBarTitle) },
-            bottomBar = { BottomNavigationBar(navController) }
-        ) { innerPadding ->
-            NavHost(
-                navController,
-                startDestination = "start",
-                Modifier
-                    .padding(innerPadding)
-                    .fillMaxSize()
+        Box(modifier = Modifier.fillMaxSize()) {  // Äußere Box für absolutes Positioning
+            Scaffold(
+                topBar = { CustomTopAppBar(title = topBarTitle) },
+                bottomBar = { BottomNavigationBar(navController) }
+            ) { innerPadding ->
+                NavHost(
+                    navController,
+                    startDestination = "start",
+                    Modifier
+                        .padding(innerPadding)
+                        .fillMaxSize()
+                ) {
+                    composable("start") {
+                        HomeScreen(viewModel)
+                    }
+                    composable("setup") {
+                        SettingsScreen()
+                    }
+                    composable("log") {
+                        LogScreen()
+                    }
+                    composable("info") {
+                        InfoScreen()
+                    }
+                }
+            }
+
+            // Snackbar außerhalb des Scaffolds aber innerhalb der Box
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .align(Alignment.TopCenter)  // Ausrichtung oben
+                    .padding(top = 40.dp)  // Abstand zur TopBar
+                    .offset(y = 8.dp)  // Feinjustierung
             ) {
-                composable("start") {
-                    HomeScreen(viewModel)
-                }
-                composable("setup") {
-                    SettingsScreen()
-                }
-                composable("log") {
-                    LogScreen()
-                }
-                composable("info") {
-                    InfoScreen()
-                }
+                SnackbarHost(
+                    hostState = snackbarHostState,
+                    modifier = Modifier.align(Alignment.Center)
+                )
             }
             if (showOwnNumberMissingDialog) {
                 OwnNumberMissingDialog(
@@ -427,7 +476,7 @@ class MainActivity : ComponentActivity(), MyInterface {
             onDismissRequest = onDismiss,
             icon = {
                 Icon(
-                    imageVector = Icons.Default.ExitToApp,
+                    imageVector = Icons.AutoMirrored.Filled.ExitToApp,
                     contentDescription = null,
                     tint = MaterialTheme.colorScheme.primary
                 )
@@ -567,8 +616,6 @@ class MainActivity : ComponentActivity(), MyInterface {
             }
         )
     }
-
-
 
     @Composable
     fun CustomTopAppBar(title: String) {
@@ -1163,15 +1210,32 @@ class MainActivity : ComponentActivity(), MyInterface {
         permissionHandler.checkAndRequestPermissions { granted ->
             if (granted) {
                 // Wenn die Berechtigung erteilt wurde, versuchen Sie, die Nummer abzurufen
-                val number = PhoneSmsUtils.getSimCardNumber(context, logger)
+                val number = PhoneSmsUtils.getSimCardNumber(context)
+                LoggingManager.logInfo(
+                    component = "MainActivity",
+                    action = "PHONE_NUMBER_RETRIEVAL",
+                    message = "Telefonnummer wurde ermittelt",
+                    details = mapOf(
+                        "numberFound" to (number.isNotEmpty()),
+                        "numberLength" to number.length,
+                        "source" to "SIM"
+                    )
+                )
                 callback(number)
             } else {
+                LoggingManager.logWarning(
+                    component = "MainActivity",
+                    action = "PHONE_NUMBER_RETRIEVAL",
+                    message = "Berechtigung zum Lesen der Telefonnummer nicht erteilt",
+                    details = mapOf(
+                        "permissionState" to "denied"
+                    )
+                )
                 // Wenn die Berechtigung nicht erteilt wurde, informieren Sie den Benutzer
-                Toast.makeText(
-                    context,
+                SnackbarManager.showError(
                     "Berechtigung zum Lesen der Telefonnummer nicht erteilt",
-                    Toast.LENGTH_SHORT
-                ).show()
+                    duration = SnackbarManager.Duration.LONG
+                )
                 callback("")
             }
         }
@@ -1219,7 +1283,7 @@ class MainActivity : ComponentActivity(), MyInterface {
                             verticalArrangement = Arrangement.spacedBy(16.dp)
                         ) {
                             ShareLogIconButton(context, logEntries)
-                            DeleteLogIconButton(context)
+                            DeleteLogIconButton()
                             RefreshLogButton(viewModel)
                         }
                     }
@@ -1243,7 +1307,7 @@ class MainActivity : ComponentActivity(), MyInterface {
                     ) {
                         ShareLogIconButton(context, logEntries)
                         Spacer(modifier = Modifier.width(16.dp))
-                        DeleteLogIconButton(context)
+                        DeleteLogIconButton()
                         Spacer(modifier = Modifier.width(16.dp))
                         RefreshLogButton(viewModel)
                     }
@@ -1267,7 +1331,16 @@ class MainActivity : ComponentActivity(), MyInterface {
                                 error: WebResourceError?
                             ) {
                                 super.onReceivedError(view, request, error)
-                                logger.addLogEntry("WebView-Fehler: ${error?.description}")
+                                LoggingManager.logError(
+                                    component = "LogScreen",
+                                    action = "WEBVIEW_ERROR",
+                                    message = "Fehler beim Laden der WebView: ${error?.description}",
+                                    details = mapOf(
+                                        "errorCode" to (error?.errorCode ?: -1),
+                                        "url" to (request?.url?.toString() ?: "unknown"),
+                                        "description" to (error?.description?.toString() ?: "unknown")
+                                    )
+                                )
                             }
                         }
                         settings.apply {
@@ -1392,11 +1465,10 @@ class MainActivity : ComponentActivity(), MyInterface {
                         )
                     )
                 } else {
-                    Toast.makeText(
-                        context,
+                    SnackbarManager.showWarning(
                         "Keine Log-Einträge zum Teilen vorhanden",
-                        Toast.LENGTH_SHORT
-                    ).show()
+                        duration = SnackbarManager.Duration.LONG
+                    )
                 }
             }
         ) {
@@ -1408,15 +1480,20 @@ class MainActivity : ComponentActivity(), MyInterface {
     }
 
     @Composable
-    fun DeleteLogIconButton(context: Context) {
+    fun DeleteLogIconButton() {
         IconButton(
             onClick = {
                 logger.clearLog()
-                Toast.makeText(
-                    context,
-                    "Logs wurden gelöscht",
-                    Toast.LENGTH_SHORT
-                ).show()
+                LoggingManager.logInfo(
+                    component = "LogScreen",
+                    action = "CLEAR_LOGS",
+                    message = "Log-Einträge wurden gelöscht",
+                    details = mapOf(
+                        "timestamp" to System.currentTimeMillis(),
+                        "userInitiated" to true
+                    )
+                )
+                SnackbarManager.showSuccess("Logs wurden gelöscht")
             }
         ) {
             Icon(
@@ -1465,6 +1542,7 @@ class MainActivity : ComponentActivity(), MyInterface {
                 }
 
                 Spacer(modifier = Modifier.width(16.dp))
+                Spacer(modifier = Modifier.width(16.dp))
                 Column {
                     Text(
                         text = "(C) 2024",
@@ -1484,7 +1562,14 @@ class MainActivity : ComponentActivity(), MyInterface {
                         textAlign = TextAlign.Start,
                         modifier = Modifier.fillMaxWidth()
                     )
+                    Text(
+                        text = "Build: ${BuildConfig.BUILD_TIME}",
+                        style = MaterialTheme.typography.bodySmall,
+                        textAlign = TextAlign.Start,
+                        modifier = Modifier.fillMaxWidth()
+                    )
                 }
+
             }
 
             Spacer(modifier = Modifier.height(16.dp))

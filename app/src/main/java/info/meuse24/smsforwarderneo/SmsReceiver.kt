@@ -120,15 +120,14 @@ class SmsReceiver : BroadcastReceiver() {
 
     /**
      * Verarbeitet Bestätigungen für gesendete SMS.
-     * Zeigt eine Toast-Nachricht an, ob das Senden erfolgreich war oder nicht.
      */
     private fun handleSmsSent(context: Context, intent: Intent) {
         val resultMessage = when (resultCode) {
             Activity.RESULT_OK -> "SMS erfolgreich gesendet"
             else -> "SMS senden fehlgeschlagen"
         }
-        // Zeigt das Ergebnis als Toast-Nachricht an
-        InterfaceHolder.myInterface?.showToast(resultMessage)
+
+        SnackbarManager.showInfo("SMSReceiver: " + resultMessage)
     }
 
     /**
@@ -300,7 +299,7 @@ class SmsWorker(context: Context, params: WorkerParameters) : Worker(context, pa
 
         return try {
             // Verwende PhoneSmsUtils.sendSms zum Versenden der SMS
-            PhoneSmsUtils.sendSms(applicationContext, phoneNumber, message, null)
+            PhoneSmsUtils.sendSms(applicationContext, phoneNumber, message)
             logSuccess(message, phoneNumber)
             Result.success()
         } catch (e: Exception) {
@@ -315,7 +314,15 @@ class SmsWorker(context: Context, params: WorkerParameters) : Worker(context, pa
      * @param phoneNumber Die Zieltelefonnummer
      */
     private fun logSuccess(message: String, phoneNumber: String) {
-        InterfaceHolder.myInterface?.addLogEntry("SMS-Weiterleitung OK: '$message' an $phoneNumber")
+        LoggingManager.logInfo(
+            component = "SMSForwarder",
+            action = "FORWARD_SMS",
+            message = "SMS erfolgreich weitergeleitet",
+            details = mapOf(
+                "message" to message,
+                "target_number" to phoneNumber
+            )
+        )
     }
 
     /**
@@ -325,9 +332,17 @@ class SmsWorker(context: Context, params: WorkerParameters) : Worker(context, pa
      * @param phoneNumber Die Zieltelefonnummer
      */
     private fun logError(e: Exception, message: String, phoneNumber: String) {
-        InterfaceHolder.myInterface?.addLogEntry("SMS-Weiterleitungsfehler: ${e.message}, '$message' an $phoneNumber")
+        LoggingManager.logError(
+            component = "SMSForwarder",
+            action = "FORWARD_SMS_ERROR",
+            message = "Fehler bei der SMS-Weiterleitung",
+            error = e,
+            details = mapOf(
+                "message" to message,
+                "target_number" to phoneNumber
+            )
+        )
     }
-
     companion object {
         const val PHONE_NUMBER_KEY = "phoneNumber"
         const val MESSAGE_KEY = "message"

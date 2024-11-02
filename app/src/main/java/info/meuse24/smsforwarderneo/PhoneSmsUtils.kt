@@ -12,11 +12,9 @@ import android.os.Looper
 import android.telephony.SmsManager
 import android.telephony.SubscriptionManager
 import android.telephony.TelephonyManager
-import android.util.Log
 import androidx.core.content.ContextCompat
 import com.google.i18n.phonenumbers.NumberParseException
 import com.google.i18n.phonenumbers.PhoneNumberUtil
-import com.google.i18n.phonenumbers.Phonenumber
 
 /**
  * PhoneSmsUtils ist eine Utility-Klasse für SMS- und Telefonie-bezogene Funktionen.
@@ -83,11 +81,15 @@ class PhoneSmsUtils private constructor() {
     }
 
     companion object {
-        private const val TAG = "PhoneSmsUtils"
+        //private const val TAG = "PhoneSmsUtils"
         //private lateinit var logger: Logger
 
         fun initialize() {
-            //this.logger = logger
+            LoggingManager.logInfo(
+                component = "PhoneSmsUtils",
+                action = "INITIALIZE",
+                message = "PhoneSmsUtils initialized"
+            )
         }
 
         /**
@@ -97,49 +99,100 @@ class PhoneSmsUtils private constructor() {
          * @param testSmsText Der zu sendende Text
          * @return true, wenn die SMS erfolgreich gesendet wurde, sonst false
          */
-        fun sendTestSms(context: Context, phoneNumber: String?, testSmsText: String, logger: Logger): Boolean {
+        fun sendTestSms(context: Context, phoneNumber: String?, testSmsText: String): Boolean {
             if (phoneNumber.isNullOrEmpty()) {
-                logMsg("No contact selected for SMS", logger)
-                InterfaceHolder.myInterface?.showToast("Kein Kontakt ausgewählt")
+                LoggingManager.logWarning(
+                    component = "PhoneSmsUtils",
+                    action = "SEND_TEST_SMS",
+                    message = "Test-SMS konnte nicht gesendet werden",
+                    details = mapOf(
+                        "reason" to "no_contact",
+                        "sms_length" to testSmsText.length
+                    )
+                )
+                SnackbarManager.showWarning("Bitte wählen Sie zuerst einen Kontakt aus")
                 return false
             }
 
             if (testSmsText.isEmpty()) {
-                logMsg("Empty SMS text", logger)
-                InterfaceHolder.myInterface?.showToast("Der SMS-Text ist leer")
+                LoggingManager.logWarning(
+                    component = "PhoneSmsUtils",
+                    action = "SEND_TEST_SMS",
+                    message = "Test-SMS konnte nicht gesendet werden",
+                    details = mapOf("reason" to "empty_text")
+                )
+                SnackbarManager.showWarning("Der SMS-Text darf nicht leer sein")
                 return false
             }
 
             if (!checkPermission(context, Manifest.permission.SEND_SMS)) {
-                Log.e(TAG, "SEND_SMS permission not granted")
-                logMsg("SEND_SMS permission not granted", logger)
-                InterfaceHolder.myInterface?.showToast("Berechtigung zum Senden von SMS nicht erteilt")
+                LoggingManager.logError(
+                    component = "PhoneSmsUtils",
+                    action = "SEND_TEST_SMS",
+                    message = "Keine Berechtigung zum Senden von SMS",
+                    details = mapOf(
+                        "permission" to "SEND_SMS",
+                        "status" to "denied"
+                    )
+                )
+                SnackbarManager.showError("Berechtigung zum Senden von SMS nicht erteilt")
                 return false
             }
 
             return try {
                 val (encodedText, smsLength) = Gsm7BitEncoder.encode(testSmsText)
-                val maxLength = if (smsLength <= 160) 160 else 153 // 153 für Multipart-SMS
+                val maxLength = if (smsLength <= 160) 160 else 153
 
                 if (smsLength > maxLength) {
-                    InterfaceHolder.myInterface?.showToast("Warnung: SMS wird in mehrere Teile aufgeteilt")
+                    LoggingManager.logInfo(
+                        component = "PhoneSmsUtils",
+                        action = "SEND_TEST_SMS",
+                        message = "SMS wird in mehrere Teile aufgeteilt",
+                        details = mapOf(
+                            "total_length" to smsLength,
+                            "max_length" to maxLength,
+                            "parts" to ((smsLength - 1) / maxLength + 1)
+                        )
+                    )
                 }
 
-                sendSms(context, phoneNumber, encodedText,logger)
-                logMsg("Test-SMS gesendet an $phoneNumber", logger)
-                InterfaceHolder.myInterface?.showToast("Test-SMS gesendet an $phoneNumber")
-                true
+                sendSms(context, phoneNumber, encodedText)
+                LoggingManager.logInfo(
+                    component = "PhoneSmsUtils",
+                    action = "SEND_TEST_SMS",
+                    message = "Test-SMS erfolgreich gesendet",
+                    details = mapOf(
+                        "recipient" to phoneNumber,
+                        "length" to smsLength,
+                        "encoding" to "GSM-7"
+                    )
+                )
+                SnackbarManager.showSuccess("Test-SMS wurde an $phoneNumber gesendet")
+                          true
             } catch (e: Exception) {
-                Log.e(TAG, "Error sending SMS", e)
-                logMsg("Error sending SMS: ${e.message}", logger)
-                handleSmsForwardingError(e, logger)
+                LoggingManager.logError(
+                    component = "PhoneSmsUtils",
+                    action = "SEND_TEST_SMS",
+                    message = "Fehler beim Senden der Test-SMS",
+                    error = e,
+                    details = mapOf(
+                        "recipient" to phoneNumber,
+                        "error_type" to e.javaClass.simpleName
+                    )
+                )
+                handleSmsForwardingError(e)
                 false
             }
         }
 
         @SuppressLint("NewApi")
-        fun sendSms(context: Context, phoneNumber: String, text: String, logger: Logger?) {
+        fun sendSms(context: Context, phoneNumber: String, text: String) {
             if (!checkPermission(context, Manifest.permission.SEND_SMS)) {
+                LoggingManager.logError(
+                    component = "PhoneSmsUtils",
+                    action = "SEND_SMS",
+                    message = "SMS permission not granted"
+                )
                 throw SecurityException("SMS permission not granted")
             }
 
@@ -152,7 +205,7 @@ class PhoneSmsUtils private constructor() {
 
             val (encodedText, smsLength) = Gsm7BitEncoder.encode(text)
             val maxLength = if (smsLength <= 160) 160 else 153
-
+            var message: String
             try {
                 if (encodedText.length > maxLength) {
                     val parts = smsManager.divideMessage(encodedText)
@@ -183,7 +236,16 @@ class PhoneSmsUtils private constructor() {
                         sentIntents,
                         deliveredIntents
                     )
-                    logMsg("Multipart SMS sent to $phoneNumber (${parts.size} parts)", logger)
+                    message = "Multipart SMS sent"
+                    LoggingManager.logInfo(
+                        component = "PhoneSmsUtils",
+                        action = "SEND_SMS",
+                        message ,
+                        details = mapOf(
+                            "recipient" to phoneNumber,
+                            "parts" to parts.size
+                        )
+                    )
                 } else {
                     val sentIntent = PendingIntent.getBroadcast(
                         context,
@@ -204,11 +266,26 @@ class PhoneSmsUtils private constructor() {
                         sentIntent,
                         deliveredIntent
                     )
-                    logMsg("Single SMS sent to $phoneNumber", logger)
+                    message = "Single SMS sent"
+                    LoggingManager.logInfo(
+                        component = "PhoneSmsUtils",
+                        action = "SEND_SMS",
+                        message ,
+                        details = mapOf("recipient" to phoneNumber)
+                    )
                 }
+                SnackbarManager.showSuccess("SMS wurde an $phoneNumber gesendet ($message).")
             } catch (e: Exception) {
+                message = "Error sending SMS"
+                LoggingManager.logError(
+                    component = "PhoneSmsUtils",
+                    action = "SEND_SMS",
+                    message ,
+                    error = e,
+                    details = mapOf("recipient" to phoneNumber)
 
-                logMsg("Error sending SMS: ${e.message}", logger)
+                )
+                SnackbarManager.showError("SMS an $phoneNumber fehlgeschlagen ($message).")
                 throw e
             }
         }
@@ -220,29 +297,44 @@ class PhoneSmsUtils private constructor() {
          * @return true, wenn der Code erfolgreich gesendet wurde, sonst false
          */
         @SuppressLint("MissingPermission")
-        fun sendUssdCode(context: Context, ussdCode: String, logger: Logger): Boolean {
+        fun sendUssdCode(context: Context, ussdCode: String): Boolean {
             if (ussdCode.isBlank()) {
-                InterfaceHolder.myInterface?.showToast("USSD-Code darf nicht leer sein")
-                logMsg("USSD code is blank", logger)
+                LoggingManager.logWarning(
+                    component = "PhoneSmsUtils",
+                    action = "SEND_USSD",
+                    message = "USSD-Code ist leer",
+                    details = mapOf("code_length" to ussdCode.length)
+                )
+                SnackbarManager.showWarning("USSD-Code darf nicht leer sein")
                 return false
             }
 
             if (!checkPermission(context, Manifest.permission.CALL_PHONE)) {
-
-                logMsg("CALL_PHONE permission not granted", logger)
-                InterfaceHolder.myInterface?.showToast("Berechtigung für Telefonanrufe nicht erteilt")
+                LoggingManager.logError(
+                    component = "PhoneSmsUtils",
+                    action = "SEND_USSD",
+                    message = "Keine Berechtigung für USSD-Codes",
+                    details = mapOf(
+                        "permission" to "CALL_PHONE",
+                        "status" to "denied"
+                    )
+                )
+                SnackbarManager.showError("Berechtigung für USSD-Codes nicht erteilt")
                 return false
             }
 
             return try {
-                val telephonyManager =
-                    context.getSystemService(Context.TELEPHONY_SERVICE) as? TelephonyManager
+                val telephonyManager = context.getSystemService(Context.TELEPHONY_SERVICE) as? TelephonyManager
                 if (telephonyManager == null) {
-                    logMsg("TelephonyManager is null", logger)
-                    InterfaceHolder.myInterface?.showToast("Telefondienst nicht verfügbar")
+                    LoggingManager.logError(
+                        component = "PhoneSmsUtils",
+                        action = "SEND_USSD",
+                        message = "TelephonyManager nicht verfügbar",
+                        details = mapOf("system_service" to "TELEPHONY_SERVICE")
+                    )
+                    SnackbarManager.showError("Telefondienst nicht verfügbar")
                     return false
                 }
-
 
                 telephonyManager.sendUssdRequest(
                     ussdCode,
@@ -252,8 +344,17 @@ class PhoneSmsUtils private constructor() {
                             request: String,
                             response: CharSequence
                         ) {
-                            logMsg("USSD Response: $response", logger)
-                            InterfaceHolder.myInterface?.showToast("USSD Antwort: $response")
+                            LoggingManager.logInfo(
+                                component = "PhoneSmsUtils",
+                                action = "USSD_RESPONSE",
+                                message = "USSD-Antwort empfangen",
+                                details = mapOf(
+                                    "request" to request,
+                                    "response" to response.toString(),
+                                    "response_length" to response.length
+                                )
+                            )
+                            SnackbarManager.showSuccess("USSD-Antwort: $response")
                         }
 
                         override fun onReceiveUssdResponseFailed(
@@ -265,57 +366,102 @@ class PhoneSmsUtils private constructor() {
                                 TelephonyManager.USSD_ERROR_SERVICE_UNAVAIL -> "Dienst nicht verfügbar"
                                 else -> "Unbekannter Fehler (Code: $failureCode)"
                             }
-                            logMsg("USSD Response Failed: $failureReason", logger)
-                            InterfaceHolder.myInterface?.showToast("USSD Fehler: $failureReason")
+
+                            LoggingManager.logError(
+                                component = "PhoneSmsUtils",
+                                action = "USSD_RESPONSE",
+                                message = "USSD-Anfrage fehlgeschlagen",
+                                details = mapOf(
+                                    "request" to request,
+                                    "failure_code" to failureCode,
+                                    "failure_reason" to failureReason
+                                )
+                            )
+                            SnackbarManager.showError("USSD-Fehler: $failureReason")
                         }
                     },
                     Handler(Looper.getMainLooper())
                 )
-                logMsg("USSD request sent: $ussdCode", logger)
-                InterfaceHolder.myInterface?.showToast("USSD-Anfrage gesendet")
+
+                LoggingManager.logInfo(
+                    component = "PhoneSmsUtils",
+                    action = "SEND_USSD",
+                    message = "USSD-Anfrage gesendet",
+                    details = mapOf(
+                        "code" to ussdCode,
+                        "code_type" to when {
+                            ussdCode.startsWith("*21*") -> "activate_forwarding"
+                            ussdCode.startsWith("##21#") -> "deactivate_forwarding"
+                            else -> "other"
+                        }
+                    )
+                )
+                SnackbarManager.showInfo("USSD-Anfrage wurde gesendet")
                 true
+
             } catch (e: SecurityException) {
-                logMsg("Security exception when sending USSD code: ${e.message}", logger)
-                InterfaceHolder.myInterface?.showToast("Sicherheitsfehler beim Senden des USSD-Codes")
+                LoggingManager.logError(
+                    component = "PhoneSmsUtils",
+                    action = "SEND_USSD",
+                    message = "Sicherheitsfehler beim Senden des USSD-Codes",
+                    error = e,
+                    details = mapOf(
+                        "code" to ussdCode,
+                        "error_type" to "security_exception"
+                    )
+                )
+                SnackbarManager.showError("Sicherheitsfehler beim Senden des USSD-Codes")
                 false
+
             } catch (e: Exception) {
-                InterfaceHolder.myInterface?.showToast("Fehler beim Senden des USSD-Codes: ${e.message}")
-                logMsg("Error sending USSD code: ${e.message}", logger,e)
+                LoggingManager.logError(
+                    component = "PhoneSmsUtils",
+                    action = "SEND_USSD",
+                    message = "Fehler beim Senden des USSD-Codes",
+                    error = e,
+                    details = mapOf(
+                        "code" to ussdCode,
+                        "error_type" to e.javaClass.simpleName
+                    )
+                )
+                SnackbarManager.showError("Fehler beim Senden des USSD-Codes: ${e.message}")
                 false
             }
         }
 
-        @SuppressLint("MissingPermission")
-        fun getSimCardNumber(context: Context, logger: Logger): String {
-            // Überprüfen der Berechtigungen
-            if (!checkPermission(context, Manifest.permission.READ_PHONE_STATE) ||
-                (!checkPermission(
-                    context,
-                    Manifest.permission.READ_PHONE_NUMBERS
-                ))
-            ) {
-                logMsg("Fehlende Berechtigungen für das Lesen der Telefonnummer", logger)
-                InterfaceHolder.myInterface?.showToast("Berechtigungen für das Lesen der Telefonnummer fehlen")
 
+        @SuppressLint("MissingPermission")
+        fun getSimCardNumber(context: Context): String {
+            if (!checkPermission(context, Manifest.permission.READ_PHONE_STATE) ||
+                !checkPermission(context, Manifest.permission.READ_PHONE_NUMBERS)
+            ) {
+                LoggingManager.logError(
+                    component = "PhoneSmsUtils",
+                    action = "GET_SIM_NUMBER",
+                    message = "Fehlende Berechtigungen für Telefonnummer",
+                    details = mapOf(
+                        "missing_permissions" to listOf(
+                            "READ_PHONE_STATE",
+                            "READ_PHONE_NUMBERS"
+                        ).joinToString()
+                    )
+                )
+                SnackbarManager.showError("Berechtigungen für das Lesen der Telefonnummer fehlen")
                 return ""
             }
 
             return try {
-                val telephonyManager =
-                    context.getSystemService(Context.TELEPHONY_SERVICE) as? TelephonyManager
-                val subscriptionManager =
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP_MR1) {
-                        context.getSystemService(Context.TELEPHONY_SUBSCRIPTION_SERVICE) as? SubscriptionManager
-                    } else null
+                val telephonyManager = context.getSystemService(Context.TELEPHONY_SERVICE) as? TelephonyManager
+                val subscriptionManager = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP_MR1) {
+                    context.getSystemService(Context.TELEPHONY_SUBSCRIPTION_SERVICE) as? SubscriptionManager
+                } else null
 
                 var phoneNumber = ""
 
-                // Versuch 1: TelephonyManager.getLine1Number()
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                     phoneNumber = telephonyManager?.line1Number.orEmpty()
                 }
 
-                // Versuch 2: SubscriptionManager (für Dual-SIM-Geräte)
                 if (phoneNumber.isEmpty() && Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP_MR1) {
                     val activeSubscriptionInfoList = subscriptionManager?.activeSubscriptionInfoList
                     for (subscriptionInfo in activeSubscriptionInfoList.orEmpty()) {
@@ -327,19 +473,49 @@ class PhoneSmsUtils private constructor() {
                     }
                 }
 
-
-                phoneNumber.ifEmpty {
-                    Log.w(TAG, "Telefonnummer konnte nicht ermittelt werden")
-                    ""
+                if (phoneNumber.isEmpty()) {
+                    LoggingManager.logWarning(
+                        component = "PhoneSmsUtils",
+                        action = "GET_SIM_NUMBER",
+                        message = "Telefonnummer konnte nicht ermittelt werden",
+                        details = mapOf(
+                            "android_version" to Build.VERSION.SDK_INT,
+                            "has_subscription_manager" to (subscriptionManager != null)
+                        )
+                    )
+                } else {
+                    LoggingManager.logInfo(
+                        component = "PhoneSmsUtils",
+                        action = "GET_SIM_NUMBER",
+                        message = "Telefonnummer erfolgreich ermittelt",
+                        details = mapOf(
+                            "number_length" to phoneNumber.length,
+                            "source" to if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) "line1Number" else "subscription_info"
+                        )
+                    )
                 }
-            } catch (e: SecurityException) {
-                logMsg("SecurityException beim Abrufen der Telefonnummer: ${e.message}", logger,e)
-                InterfaceHolder.myInterface?.showToast("Sicherheitsfehler beim Abrufen der Telefonnummer")
-                ""
-            } catch (e: Exception) {
-                logMsg("Fehler beim Abrufen der Telefonnummer: ${e.message}", logger,e)
-                InterfaceHolder.myInterface?.showToast("Fehler beim Abrufen der Telefonnummer: ${e.message}")
 
+                phoneNumber
+
+            } catch (e: SecurityException) {
+                LoggingManager.logError(
+                    component = "PhoneSmsUtils",
+                    action = "GET_SIM_NUMBER",
+                    message = "Sicherheitsfehler beim Abrufen der Telefonnummer",
+                    error = e
+                )
+                SnackbarManager.showError("Sicherheitsfehler beim Abrufen der Telefonnummer")
+                ""
+
+            } catch (e: Exception) {
+                LoggingManager.logError(
+                    component = "PhoneSmsUtils",
+                    action = "GET_SIM_NUMBER",
+                    message = "Fehler beim Abrufen der Telefonnummer",
+                    error = e,
+                    details = mapOf("error_type" to e.javaClass.simpleName)
+                )
+                SnackbarManager.showError("Fehler beim Abrufen der Telefonnummer: ${e.message}")
                 ""
             }
         }
@@ -362,14 +538,44 @@ class PhoneSmsUtils private constructor() {
          * Behandelt Fehler beim Weiterleiten von SMS.
          * @param e Die aufgetretene Exception
          */
-        private fun handleSmsForwardingError(e: Exception, logger: Logger) {
+
+        private fun handleSmsForwardingError(e: Exception) {
             val errorMessage = when (e) {
-                is SecurityException -> "Fehlende Berechtigung zum Senden von SMS"
-                is IllegalArgumentException -> "Ungültige Telefonnummer oder leere Nachricht"
-                else -> "SMS-Weiterleitung fehlgeschlagen: ${e.message}"
+                is SecurityException -> {
+                    LoggingManager.logError(
+                        component = "PhoneSmsUtils",
+                        action = "HANDLE_SMS_ERROR",
+                        message = "Fehlende Berechtigung zum Senden von SMS",
+                        error = e,
+                        details = mapOf("error_type" to "security_exception")
+                    )
+                    "Fehlende Berechtigung zum Senden von SMS"
+                }
+                is IllegalArgumentException -> {
+                    LoggingManager.logError(
+                        component = "PhoneSmsUtils",
+                        action = "HANDLE_SMS_ERROR",
+                        message = "Ungültige Telefonnummer oder leere Nachricht",
+                        error = e,
+                        details = mapOf("error_type" to "invalid_argument")
+                    )
+                    "Ungültige Telefonnummer oder leere Nachricht"
+                }
+                else -> {
+                    LoggingManager.logError(
+                        component = "PhoneSmsUtils",
+                        action = "HANDLE_SMS_ERROR",
+                        message = "Unerwarteter Fehler bei der SMS-Weiterleitung",
+                        error = e,
+                        details = mapOf(
+                            "error_type" to e.javaClass.simpleName,
+                            "error_message" to (e.message ?: "Unknown error")
+                        )
+                    )
+                    "SMS-Weiterleitung fehlgeschlagen: ${e.message}"
+                }
             }
-            logMsg(errorMessage, logger,e)
-            InterfaceHolder.myInterface?.showToast(errorMessage)
+            SnackbarManager.showError(errorMessage)
         }
 
         /**
@@ -386,9 +592,28 @@ class PhoneSmsUtils private constructor() {
         }
 
         // Hilfsmethode für Logging
-        private fun logMsg(message: String, logger: Logger?=null, e: Exception? = null) {
-            Log.e(TAG, message, e)
-            logger?.addLogEntry("Log: $message ${e?.message ?: ""}")
+        private fun logMsg(message: String, e: Exception? = null) {
+            if (e != null) {
+                LoggingManager.logError(
+                    component = "PhoneSmsUtils",
+                    action = "SYSTEM",
+                    message = message,
+                    error = e,
+                    details = mapOf(
+                        "error_type" to e.javaClass.simpleName,
+                        "error_message" to (e.message ?: "Unknown error")
+                    )
+                )
+            } else {
+                LoggingManager.logInfo(
+                    component = "PhoneSmsUtils",
+                    action = "SYSTEM",
+                    message = message,
+                    details = mapOf(
+                        "timestamp" to System.currentTimeMillis()
+                    )
+                )
+            }
         }
 
         private val COUNTRY_CODES = mapOf(
@@ -661,7 +886,7 @@ class PhoneSmsUtils private constructor() {
 // In PhoneSmsUtils.kt - ersetze die bestehende getSimCardCountryCode Methode:
 
         @SuppressLint("MissingPermission")
-        fun getSimCardCountryCode(context: Context, logger: Logger): String {
+        fun getSimCardCountryCode(context: Context): String {
             try {
                 val telephonyManager = context.getSystemService(Context.TELEPHONY_SERVICE) as? TelephonyManager
                     ?: return ""  // Geändert von "+43" zu ""
@@ -669,7 +894,7 @@ class PhoneSmsUtils private constructor() {
                 // Prüfe ob notwendige Berechtigungen vorhanden sind
                 if (ContextCompat.checkSelfPermission(context, Manifest.permission.READ_PHONE_STATE)
                     != PackageManager.PERMISSION_GRANTED) {
-                    logMsg("READ_PHONE_STATE permission not granted", logger)
+                    logMsg("READ_PHONE_STATE permission not granted")
                     return ""  // Geändert von "+43" zu ""
                 }
 
@@ -701,11 +926,11 @@ class PhoneSmsUtils private constructor() {
                 }
 
                 // Keine Erkennung möglich
-                logMsg("Keine Ländervorwahl erkannt, verwende Default", logger)
+                logMsg("Keine Ländervorwahl erkannt, verwende Default")
                 return ""
 
             } catch (e: Exception) {
-                logMsg("Fehler bei der Erkennung der Ländervorwahl: ${e.message}", logger, e)
+                logMsg("Fehler bei der Erkennung der Ländervorwahl: ${e.message}",  e)
                 return "" // Signalisiert: Keine Erkennung möglich
             }
         }
