@@ -6,19 +6,26 @@ junit = "4.13.2"
 junitVersion = "1.2.1"
 espressoCore = "3.6.1"
 libphonenumber = "8.13.19"
-lifecycleRuntimeKtx = "2.8.6"
-composeBom = "2024.10.00"
+lifecycleRuntimeKtx = "2.8.7"
+composeBom = "2024.10.01"
 securityCrypto = "1.1.0-alpha06"
 workRuntimeKtx = "2.9.1"
 navigationCompose = "2.8.3"
 navigationRuntimeKtx = "2.8.3"
 appcompat = "1.7.0"
 roomCommon = "2.6.1"
+javamail = "1.6.7"
 kotlinTest = "2.1.0-Beta2"
 kotlinxCoroutinesTest = "1.9.0"
 material = "1.12.0"
+compose-icons = "1.5.4"
 
 [libraries]
+
+compose-icons-core = { group = "androidx.compose.material", name = "material-icons-core", version.ref = "compose-icons" }
+compose-icons-extended = { group = "androidx.compose.material", name = "material-icons-extended", version.ref = "compose-icons" }
+android-mail = { group = "com.sun.mail", name = "android-mail", version.ref = "javamail" }
+android-activation = { group = "com.sun.mail", name = "android-activation", version.ref = "javamail" }
 androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
 androidx-security-crypto = { module = "androidx.security:security-crypto", version.ref = "securityCrypto" }
 junit = { group = "junit", name = "junit", version.ref = "junit" }
@@ -40,8 +47,7 @@ androidx-navigation-runtime-ktx = { group = "androidx.navigation", name = "navig
 androidx-appcompat = { group = "androidx.appcompat", name = "appcompat", version.ref = "appcompat" }
 androidx-room-common = { group = "androidx.room", name = "room-common", version.ref = "roomCommon" }
 libphonenumber = { module = "com.googlecode.libphonenumber:libphonenumber", version.ref = "libphonenumber" }
-kotlin-test = { group = "org.jetbrains.kotlin", name = "kotlin-test", version.ref = "kotlinTest" }
-kotlinx-coroutines-test = { group = "org.jetbrains.kotlinx", name = "kotlinx-coroutines-test", version.ref = "kotlinxCoroutinesTest" }
+
 material = { group = "com.google.android.material", name = "material", version.ref = "material" }
 
 [plugins]

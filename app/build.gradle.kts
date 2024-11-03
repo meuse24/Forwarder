@@ -10,13 +10,21 @@ plugins {
 }
 
 android {
+    packaging {
+        resources {
+            pickFirsts += mutableSetOf(
+                "META-INF/LICENSE*",
+                "META-INF/NOTICE*"
+            )
+        }
+    }
 
     compileOptions {
-        sourceCompatibility = JavaVersion.VERSION_11
-        targetCompatibility = JavaVersion.VERSION_11
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
     }
     kotlinOptions {
-        jvmTarget = "11"
+        jvmTarget = "17"
     }
 
     buildFeatures {
@@ -87,13 +95,7 @@ android {
             )
         }
     }
-    compileOptions {
-        sourceCompatibility = JavaVersion.VERSION_1_8
-        targetCompatibility = JavaVersion.VERSION_1_8
-    }
-    kotlinOptions {
-        jvmTarget = "1.8"
-    }
+
     buildFeatures {
         compose = true
     }
@@ -124,7 +126,10 @@ dependencies {
     implementation(libs.libphonenumber)
     implementation(libs.androidx.espresso.core)
     implementation(libs.material)
-
+    implementation(libs.android.mail)
+    implementation(libs.android.activation)
+    implementation(libs.compose.icons.core)
+    implementation(libs.compose.icons.extended)
     testImplementation(libs.junit)
 
     androidTestImplementation(libs.androidx.junit)

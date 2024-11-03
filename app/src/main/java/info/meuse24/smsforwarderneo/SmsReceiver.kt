@@ -15,10 +15,26 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.pm.PackageManager
+import android.content.res.Configuration
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
+import android.os.PowerManager
 import androidx.core.app.NotificationCompat
+import androidx.core.content.ContextCompat
+import androidx.lifecycle.AtomicReference
 import androidx.work.Worker
 import androidx.work.WorkerParameters
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 /**
  * SmsReceiver ist ein BroadcastReceiver, der eingehende SMS-Nachrichten empfängt und verarbeitet.
@@ -42,18 +58,17 @@ class SmsReceiver : BroadcastReceiver() {
         Log.d(TAG, "onReceive: ${intent.action}")
         prefsManager = SharedPreferencesManager(context)
 
-        // Überprüfen Sie die Berechtigung des Senders
-//        if (context.checkCallingOrSelfPermission(android.Manifest.permission.BROADCAST_SMS) != PackageManager.PERMISSION_GRANTED) {
-//            Log.w(TAG, "Received intent from sender without BROADCAST_SMS permission")
-//            return
-//        }
 
         when (intent.action) {
             Telephony.Sms.Intents.SMS_RECEIVED_ACTION -> {
                 if (isSmsIntentValid(intent)) {
                     handleSmsReceived(context, intent)
                 } else {
-                    Log.w(TAG, "Received invalid SMS intent")
+                    LoggingManager.logWarning(
+                        component = "SmsReceiver",
+                        action = "INVALID_SMS",
+                        message = "Ungültige SMS empfangen"
+                    )
                 }
             }
             "SMS_SENT" -> handleSmsSent(context, intent)
@@ -86,36 +101,129 @@ class SmsReceiver : BroadcastReceiver() {
      */
     private fun handleSmsReceived(context: Context, intent: Intent) {
         // Startet den Vordergrund-Service für zuverlässige Verarbeitung
-        startForegroundService(context)
+        //startForegroundService(context)
 
-        // Prüft, ob die SMS-Weiterleitung aktiviert ist
-        if (prefsManager.isForwardingActive()) {
-            // Extrahiert alle SMS-Nachrichten aus dem Intent
-            val messages = Telephony.Sms.Intents.getMessagesFromIntent(intent)
-            // Map zur Zusammenführung von SMS-Teilen pro Absender
-            val smsMap = mutableMapOf<String, StringBuilder>()
+        // Extrahiert alle SMS-Nachrichten aus dem Intent
+        val messages = Telephony.Sms.Intents.getMessagesFromIntent(intent)
+        // Map zur Zusammenführung von SMS-Teilen pro Absender
+        val smsMap = mutableMapOf<String, StringBuilder>()
 
-            // Iteriert über alle empfangenen Nachrichten
-            messages.forEach { smsMessage ->
-                val sender = smsMessage.originatingAddress ?: return@forEach
-                val messageBody = smsMessage.messageBody
+        // Iteriert über alle empfangenen Nachrichten
+        messages.forEach { smsMessage ->
+            val sender = smsMessage.originatingAddress ?: return@forEach
+            val messageBody = smsMessage.messageBody
 
-                // Fügt den Nachrichtentext zum entsprechenden Absender hinzu oder erstellt einen neuen Eintrag
-                smsMap.getOrPut(sender) { StringBuilder() }.append(messageBody)
-            }
+            // Fügt den Nachrichtentext zum entsprechenden Absender hinzu oder erstellt einen neuen Eintrag
+            smsMap.getOrPut(sender) { StringBuilder() }.append(messageBody)
+        }
 
-            // Verarbeitet jede zusammengeführte Nachricht
-            smsMap.forEach { (sender, messageBody) ->
-                // Holt die Weiterleitungsnummer aus den Einstellungen
+        // Verarbeitet jede zusammengeführte Nachricht
+        smsMap.forEach { (sender, messageBody) ->
+            // SMS-zu-SMS Weiterleitung (unabhängig)
+            if (prefsManager.isForwardingActive()) {
                 prefsManager.getSelectedPhoneNumber()?.let { forwardToNumber ->
-                    // Erstellt die vollständige Nachricht mit Absenderinformation
                     val fullMessage = "Von: $sender\n$messageBody"
-                    Log.d(TAG, "SMS Weiterleitung: $fullMessage")
-                    // Leitet die Nachricht über den SmsWorker weiter
                     forwardSmsWithSmsWorker(context, forwardToNumber, fullMessage)
                 }
             }
+
+            // SMS-zu-Email Weiterleitung (unabhängig)
+            if (prefsManager.isForwardSmsToEmail()) {
+                handleEmailForwarding(context, sender, messageBody.toString())
+            }
         }
+    }
+
+    private fun handleEmailForwarding(context: Context, sender: String, messageBody: String) {
+        val prefsManager = SharedPreferencesManager(context)
+        val emailAddresses = prefsManager.getEmailAddresses()
+
+        if (emailAddresses.isEmpty()) {
+            LoggingManager.logWarning(
+                component = "SmsReceiver",
+                action = "EMAIL_FORWARD",
+                message = "Keine Email-Adressen konfiguriert"
+            )
+            return
+        }
+
+        // Hole SMTP-Einstellungen konsistent aus SharedPreferences
+        val host = prefsManager.getSmtpHost()
+        val port = prefsManager.getSmtpPort()
+        val username = prefsManager.getSmtpUsername()
+        val password = prefsManager.getSmtpPassword()
+
+        if (host.isEmpty() || username.isEmpty() || password.isEmpty()) {
+            LoggingManager.logWarning(
+                component = "SmsReceiver",
+                action = "EMAIL_FORWARD",
+                message = "Unvollständige SMTP-Konfiguration",
+                details = mapOf(
+                    "has_host" to host.isNotEmpty(),
+                    "has_username" to username.isNotEmpty(),
+                    "has_credentials" to password.isNotEmpty()
+                )
+            )
+            return
+        }
+
+        val emailSender = EmailSender(host, port, username, password)
+        val subject = "Neue SMS von $sender"
+        val body = buildString {
+            append("SMS Weiterleitung\n\n")
+            append("Absender: $sender\n")
+            append("Zeitpunkt: ${getCurrentTimestamp()}\n\n")
+            append("Nachricht:\n")
+            append(messageBody)
+            append("\n\nDiese E-Mail wurde automatisch durch den SMS Forwarder generiert.")
+        }
+
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                when (val result = emailSender.sendEmail(emailAddresses, subject, body)) {
+                    is EmailResult.Success -> {
+                        LoggingManager.logInfo(
+                            component = "SmsReceiver",
+                            action = "EMAIL_FORWARD",
+                            message = "SMS erfolgreich per Email weitergeleitet",
+                            details = mapOf(
+                                "sender" to sender,
+                                "recipients" to emailAddresses.size,
+                                "smtp_host" to host,
+                                "message_length" to messageBody.length
+                            )
+                        )
+                    }
+                    is EmailResult.Error -> {
+                        LoggingManager.logError(
+                            component = "SmsReceiver",
+                            action = "EMAIL_FORWARD",
+                            message = "Email-Weiterleitung fehlgeschlagen",
+                            details = mapOf(
+                                "error" to result.message,
+                                "smtp_host" to host,
+                                "has_credentials" to (username.isNotEmpty() && password.isNotEmpty())
+                            )
+                        )
+                    }
+                }
+            } catch (e: Exception) {
+                LoggingManager.logError(
+                    component = "SmsReceiver",
+                    action = "EMAIL_FORWARD",
+                    message = "Unerwarteter Fehler bei Email-Weiterleitung",
+                    error = e,
+                    details = mapOf(
+                        "smtp_host" to host,
+                        "error_type" to e.javaClass.simpleName
+                    )
+                )
+            }
+        }
+    }
+
+    private fun getCurrentTimestamp(): String {
+        return SimpleDateFormat("dd.MM.yyyy HH:mm:ss", Locale.getDefault()).format(Date())
     }
 
     /**
@@ -168,29 +276,47 @@ class SmsReceiver : BroadcastReceiver() {
     }
 }
 
-
-
 class SmsForegroundService : Service() {
     private var isServiceRunning = false
     private var currentNotificationText = "App läuft im Hintergrund."
+    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    private val restartHandler = Handler(Looper.getMainLooper())
+    private val restartRunnable = Runnable { restartService() }
+
+    private val notificationManager by lazy {
+        getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+    }
 
     companion object {
+        private const val TAG = "SmsForegroundService"
         private const val CHANNEL_ID = "SmsForwarderChannel"
         private const val NOTIFICATION_ID = 1
-        private const val TAG = "SmsForegroundService"
+        private const val RESTART_DELAY = 1000L // 1 Sekunde
+        private var isRunning = false
+
+        // Atomic-Referenz für Prozess-übergreifende Konsistenz
+        private val serviceInstance = AtomicReference<SmsForegroundService>()
+
+        fun isServiceActive() = isRunning
 
         fun startService(context: Context) {
-            val intent = Intent(context, SmsForegroundService::class.java)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                context.startForegroundService(intent)
-            } else {
-                context.startService(intent)
+            if (!isRunning) {
+                val intent = Intent(context, SmsForegroundService::class.java).apply {
+                    action = "START_SERVICE"
+                }
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    context.startForegroundService(intent)
+                } else {
+                    context.startService(intent)
+                }
             }
         }
 
         fun stopService(context: Context) {
-            val intent = Intent(context, SmsForegroundService::class.java)
-            context.stopService(intent)
+            if (isRunning) {
+                val intent = Intent(context, SmsForegroundService::class.java)
+                context.stopService(intent)
+            }
         }
 
         fun updateNotification(context: Context, contentText: String) {
@@ -198,86 +324,383 @@ class SmsForegroundService : Service() {
                 action = "UPDATE_NOTIFICATION"
                 putExtra("contentText", contentText)
             }
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                context.startForegroundService(intent)
-            } else {
-                context.startService(intent)
-            }
-        }
-    }
-
-    private lateinit var notificationManager: NotificationManager
-
-    override fun onCreate() {
-        super.onCreate()
-        notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        createNotificationChannel()
-        Log.d(TAG, "Service onCreate")
-    }
-
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        when (intent?.action) {
-            "UPDATE_NOTIFICATION" -> {
-                val contentText = intent.getStringExtra("contentText") ?: return START_NOT_STICKY
-                updateNotification(contentText)
-            }
-            else -> {
-                if (!isServiceRunning) {
-                    isServiceRunning = true
-                    startForeground(NOTIFICATION_ID, createNotification(currentNotificationText))
-                    Log.d(TAG, "Service started with notification: $currentNotificationText")
+            if (isRunning) {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    context.startForegroundService(intent)
+                } else {
+                    context.startService(intent)
                 }
             }
         }
-        return START_STICKY
     }
 
-    override fun onDestroy() {
-        super.onDestroy()
-        isServiceRunning = false
-        Log.d(TAG, "Service destroyed")
+    override fun onCreate() {
+        super.onCreate()
+        try {
+            serviceInstance.set(this)
+            createNotificationChannel()
+            acquireWakeLock()
+            isRunning = true
+            LoggingManager.logInfo(
+                component = "SmsForegroundService",
+                action = "CREATE",
+                message = "Foreground Service wurde erstellt"
+            )
+        } catch (e: Exception) {
+            LoggingManager.logError(
+                component = "SmsForegroundService",
+                action = "CREATE_ERROR",
+                message = "Fehler beim Erstellen des Services",
+                error = e
+            )
+            stopSelf()
+        }
     }
 
-    override fun onBind(intent: Intent?): IBinder? = null
+    private var wakeLock: PowerManager.WakeLock? = null
+
+    private fun acquireWakeLock() {
+        if (wakeLock == null) {
+            val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
+            wakeLock = powerManager.newWakeLock(
+                PowerManager.PARTIAL_WAKE_LOCK,
+                "SmsForwarder:ForegroundService"
+            ).apply {
+                setReferenceCounted(false)
+                acquire(10*60*1000L /*10 minutes*/)
+            }
+        }
+    }
+
+    private fun releaseWakeLock() {
+        wakeLock?.let {
+            if (it.isHeld) {
+                it.release()
+            }
+        }
+        wakeLock = null
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        try {
+            when (intent?.action) {
+                "START_SERVICE" -> {
+                    if (!isServiceRunning) {
+                        startForegroundService()
+                    }
+                }
+                "UPDATE_NOTIFICATION" -> {
+                    val newText = intent.getStringExtra("contentText")
+                    if (newText != null && newText != currentNotificationText) {
+                        currentNotificationText = newText
+                        updateNotification(newText)
+                    }
+                }
+                else -> {
+                    if (!isServiceRunning) {
+                        startForegroundService()
+                    }
+                }
+            }
+
+            // Starte Heartbeat-Monitoring
+            scheduleHeartbeat()
+
+            return START_STICKY
+        } catch (e: Exception) {
+            LoggingManager.logError(
+                component = "SmsForegroundService",
+                action = "START_COMMAND_ERROR",
+                message = "Fehler im onStartCommand",
+                error = e
+            )
+            stopSelf()
+            return START_NOT_STICKY
+        }
+    }
+
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        // Keine Neuerstellung der Notification notwendig
+    }
 
     private fun createNotificationChannel() {
-        val channel = NotificationChannel(
-            CHANNEL_ID,
-            "SMS Forwarder Service",
-            NotificationManager.IMPORTANCE_LOW
-        ).apply {
-            description = "App läuft im Hintergrund."
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            try {
+                // Prüfe ob der Channel bereits existiert
+                val existingChannel = notificationManager.getNotificationChannel(CHANNEL_ID)
+                if (existingChannel != null) {
+                    LoggingManager.logInfo(
+                        component = "SmsForegroundService",
+                        action = "NOTIFICATION_CHANNEL",
+                        message = "Notification Channel existiert bereits",
+                        details = mapOf(
+                            "channel_id" to CHANNEL_ID,
+                            "importance" to existingChannel.importance
+                        )
+                    )
+                    return
+                }
+
+                val channel = NotificationChannel(
+                    CHANNEL_ID,
+                    "SMS Forwarder Service",
+                    NotificationManager.IMPORTANCE_DEFAULT
+                ).apply {
+                    description = "Zeigt den Status der SMS/Anruf-Weiterleitung an"
+                    setShowBadge(true)
+                    enableLights(true)
+                    enableVibration(true)
+                    lockscreenVisibility = Notification.VISIBILITY_PUBLIC
+                }
+
+                notificationManager.createNotificationChannel(channel)
+
+                LoggingManager.logInfo(
+                    component = "SmsForegroundService",
+                    action = "NOTIFICATION_CHANNEL",
+                    message = "Neuer Notification Channel erstellt",
+                    details = mapOf(
+                        "channel_id" to CHANNEL_ID,
+                        "importance" to channel.importance
+                    )
+                )
+            } catch (e: Exception) {
+                LoggingManager.logError(
+                    component = "SmsForegroundService",
+                    action = "NOTIFICATION_CHANNEL_ERROR",
+                    message = "Fehler beim Erstellen des Notification Channels",
+                    error = e
+                )
+            }
         }
-        notificationManager.createNotificationChannel(channel)
     }
 
     private fun createNotification(contentText: String): Notification {
-        val notificationIntent = Intent(this, MainActivity::class.java)
+        val notificationIntent = Intent(this, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK
+        }
+
+        val pendingIntentFlags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        } else {
+            PendingIntent.FLAG_UPDATE_CURRENT
+        }
+
         val pendingIntent = PendingIntent.getActivity(
-            this, 0, notificationIntent, PendingIntent.FLAG_IMMUTABLE
+            this,
+            0,
+            notificationIntent,
+            pendingIntentFlags
         )
 
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("TEL/SMS Forwarder")
             .setContentText(contentText)
-            .setSmallIcon(android.R.drawable.ic_media_play)
+            .setStyle(NotificationCompat.BigTextStyle().bigText(contentText))
+            .setSmallIcon(android.R.drawable.ic_dialog_alert)
+            .setOngoing(true)
+            .setAutoCancel(false)
             .setContentIntent(pendingIntent)
-            .build()
+            .setPriority(NotificationCompat.PRIORITY_DEFAULT) // Geändert von HIGH zu DEFAULT
+            .setCategory(NotificationCompat.CATEGORY_SERVICE)
+            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+            .setOnlyAlertOnce(true) // Verhindert wiederholte Benachrichtigungen
+            .build().apply {
+                flags = flags or Notification.FLAG_NO_CLEAR or Notification.FLAG_ONGOING_EVENT
+            }
     }
 
     fun updateNotification(contentText: String) {
-        if (isServiceRunning) {
-            currentNotificationText = contentText
-            val notification = createNotification(contentText)
-            notificationManager.notify(NOTIFICATION_ID, notification)
-            Log.d(TAG, "Notification updated: $contentText")
-        } else {
-            Log.w(TAG, "Attempted to update notification, but service is not running")
+        try {
+            if (isServiceRunning) {
+                currentNotificationText = contentText
+                val notification = createNotification(contentText)
+                notificationManager.notify(NOTIFICATION_ID, notification)
+                LoggingManager.logInfo(
+                    component = "SmsForegroundService",
+                    action = "UPDATE_NOTIFICATION",
+                    message = "Notification aktualisiert: $contentText"
+                )
+            }
+        } catch (e: Exception) {
+            LoggingManager.logError(
+                component = "SmsForegroundService",
+                action = "UPDATE_ERROR",
+                message = "Fehler beim Aktualisieren der Notification",
+                error = e
+            )
         }
     }
+
+    private fun checkNotificationPermission() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            Log.d(TAG, "Notification permission: ${
+                ContextCompat.checkSelfPermission(
+                    this,
+                    android.Manifest.permission.POST_NOTIFICATIONS
+                ) == PackageManager.PERMISSION_GRANTED
+            }")
+        }
+    }
+
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    private fun startForegroundService() {
+        isServiceRunning = true
+        val prefs = SharedPreferencesManager(this)
+        val initialStatus = buildServiceStatus(prefs)
+        currentNotificationText = initialStatus
+        val notification = createNotification(initialStatus)
+        startForeground(NOTIFICATION_ID, notification)
+
+        // Starte Monitoring im ServiceScope
+        serviceScope.launch {
+            monitorService()
+        }
+    }
+
+    private suspend fun monitorService() {
+        while (isServiceRunning) {
+            try {
+                // Prüfe Service-Status
+                ensureServiceRunning()
+                delay(30000) // Alle 30 Sekunden
+            } catch (e: Exception) {
+                LoggingManager.logError(
+                    component = "SmsForegroundService",
+                    action = "MONITOR_ERROR",
+                    message = "Fehler beim Service-Monitoring",
+                    error = e
+                )
+            }
+        }
+    }
+
+    private fun ensureServiceRunning() {
+        if (!isServiceRunning || !isRunning) {
+            restartService()
+        }
+    }
+
+    private fun scheduleHeartbeat() {
+        restartHandler.removeCallbacks(restartRunnable)
+        restartHandler.postDelayed(restartRunnable, RESTART_DELAY)
+    }
+
+    private fun restartService() {
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                stopForeground(STOP_FOREGROUND_REMOVE)
+            } else {
+                @Suppress("DEPRECATION")
+                stopForeground(true)
+            }
+            startForegroundService()
+        } catch (e: Exception) {
+            LoggingManager.logError(
+                component = "SmsForegroundService",
+                action = "RESTART_ERROR",
+                message = "Fehler beim Neustart des Services",
+                error = e
+            )
+        }
+    }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    private fun buildServiceStatus(prefs: SharedPreferencesManager): String {
+        val smsForwardingActive = prefs.isForwardingActive()
+        val emailForwardingActive = prefs.isForwardSmsToEmail()
+        return buildString {
+            if (!smsForwardingActive && !emailForwardingActive) {
+                append("Keine Weiterleitung aktiv")
+            } else {
+                if (smsForwardingActive) {
+                    append("SMS-Weiterleitung aktiv")
+                    prefs.getSelectedPhoneNumber()?.let { number ->
+                        append(" zu $number")
+                    }
+                }
+                if (emailForwardingActive) {
+                    if (smsForwardingActive) append("\n")
+                    append("Email-Weiterleitung aktiv")
+                    val emailCount = prefs.getEmailAddresses().size
+                    append(" an $emailCount Email(s)")
+                }
+            }
+        }
+    }
+
+
+    override fun onDestroy() {
+        try {
+            serviceScope.cancel()
+            restartHandler.removeCallbacks(restartRunnable)
+            releaseWakeLock()
+            isServiceRunning = false
+            isRunning = false
+            serviceInstance.set(null)
+
+            // Versuche Neustart wenn nicht explizit beendet
+            if (SharedPreferencesManager(this).getKeepForwardingOnExit()) {
+                startService(this)
+            }
+
+            LoggingManager.logInfo(
+                component = "SmsForegroundService",
+                action = "DESTROY",
+                message = "Foreground Service wurde beendet"
+            )
+        } catch (e: Exception) {
+            LoggingManager.logError(
+                component = "SmsForegroundService",
+                action = "DESTROY_ERROR",
+                message = "Fehler beim Beenden des Services",
+                error = e
+            )
+        } finally {
+            super.onDestroy()
+        }
+    }
+
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        super.onTaskRemoved(rootIntent)
+        // Prüfe ob Service weiterlaufen soll
+        if (SharedPreferencesManager(this).getKeepForwardingOnExit()) {
+            restartService()
+        } else {
+            stopSelf()
+        }
+    }
+
+
+
+
+
+
+
 }
-
-
 
 /**
  * SmsWorker-Klasse für das Versenden von SMS-Nachrichten.

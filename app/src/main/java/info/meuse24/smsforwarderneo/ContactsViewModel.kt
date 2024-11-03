@@ -10,6 +10,7 @@ import android.content.SharedPreferences
 import android.content.pm.PackageManager
 import android.database.ContentObserver
 import android.net.Uri
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.os.PowerManager
@@ -73,7 +74,6 @@ class ContactsViewModel(
     private val logger: Logger
 ) : AndroidViewModel(application), DefaultLifecycleObserver {
 
-    //private val loggingHelper = LoggingHelper(logger)
     private val contactsStore = ContactsStore(logger)
     // StateFlows für verschiedene UI-Zustände
     private val _contacts = MutableStateFlow<List<Contact>>(emptyList())
@@ -121,6 +121,12 @@ class ContactsViewModel(
     private val _showProgressDialog = MutableStateFlow(false)
     val showProgressDialog: StateFlow<Boolean> = _showProgressDialog.asStateFlow()
 
+    private val _emailAddresses = MutableStateFlow<List<String>>(emptyList())
+    val emailAddresses: StateFlow<List<String>> = _emailAddresses.asStateFlow()
+
+    private val _newEmailAddress = MutableStateFlow("")
+    val newEmailAddress: StateFlow<String> = _newEmailAddress.asStateFlow()
+
     private val _errorState = MutableStateFlow<ErrorDialogState?>(null)
     val errorState: StateFlow<ErrorDialogState?> = _errorState.asStateFlow()
 
@@ -133,12 +139,234 @@ class ContactsViewModel(
     private val _showOwnNumberMissingDialog = MutableStateFlow(false)
     val showOwnNumberMissingDialog: StateFlow<Boolean> = _showOwnNumberMissingDialog.asStateFlow()
 
+    private val _forwardSmsToEmail = MutableStateFlow(prefsManager.isForwardSmsToEmail())
+    val forwardSmsToEmail: StateFlow<Boolean> = _forwardSmsToEmail.asStateFlow()
+
     private val _keepForwardingOnExit = MutableStateFlow(prefsManager.getKeepForwardingOnExit())
     //val keepForwardingOnExit: StateFlow<Boolean> = _keepForwardingOnExit.asStateFlow()
     private var filterJob: Job? = null
     private var initializationJob: Job? = null
     private val filterMutex = Mutex() // Verhindert parallele Filteroperationen
 
+    private val _smtpHost = MutableStateFlow(prefsManager.getSmtpHost())
+    val smtpHost: StateFlow<String> = _smtpHost.asStateFlow()
+
+    private val _smtpPort = MutableStateFlow(prefsManager.getSmtpPort())
+    val smtpPort: StateFlow<Int> = _smtpPort.asStateFlow()
+
+    private val _smtpUsername = MutableStateFlow(prefsManager.getSmtpUsername())
+    val smtpUsername: StateFlow<String> = _smtpUsername.asStateFlow()
+
+    private val _smtpPassword = MutableStateFlow(prefsManager.getSmtpPassword())
+    val smtpPassword: StateFlow<String> = _smtpPassword.asStateFlow()
+
+    // Neue StateFlow für Test-Email-Text
+    private val _testEmailText = MutableStateFlow(prefsManager.getTestEmailText())
+    val testEmailText: StateFlow<String> = _testEmailText.asStateFlow()
+
+
+    fun updateNewEmailAddress(email: String) {
+        _newEmailAddress.value = email
+    }
+
+fun addEmailAddress() {
+        val email = _newEmailAddress.value.trim()
+        if (email.isNotEmpty() && android.util.Patterns.EMAIL_ADDRESS.matcher(email).matches()) {
+            viewModelScope.launch {
+                val currentList = _emailAddresses.value.toMutableList()
+                if (!currentList.contains(email)) {
+                    currentList.add(email)
+                    _emailAddresses.value = currentList
+                    prefsManager.saveEmailAddresses(currentList)
+                    _newEmailAddress.value = "" // Reset input field
+                    SnackbarManager.showSuccess("E-Mail-Adresse hinzugefügt")
+                } else {
+                    SnackbarManager.showWarning("E-Mail-Adresse existiert bereits")
+                }
+            }
+        } else {
+            SnackbarManager.showError("Ungültige E-Mail-Adresse")
+        }
+    }
+
+    fun removeEmailAddress(email: String) {
+        viewModelScope.launch {
+            val currentList = _emailAddresses.value.toMutableList()
+            currentList.remove(email)
+            _emailAddresses.value = currentList
+            prefsManager.saveEmailAddresses(currentList)
+
+            // Wenn die Liste leer ist, deaktiviere die SMS-Email-Weiterleitung
+            if (currentList.isEmpty() && _forwardSmsToEmail.value) {
+                _forwardSmsToEmail.value = false
+                prefsManager.setForwardSmsToEmail(false)
+                LoggingManager.log(
+                    LoggingHelper.LogLevel.INFO,
+                    LoggingHelper.LogMetadata(
+                        component = "ContactsViewModel",
+                        action = "SMS_EMAIL_FORWARD_AUTO_DISABLE",
+                        details = mapOf(
+                            "reason" to "no_email_addresses"
+                        )
+                    ),
+                    "SMS-E-Mail-Weiterleitung automatisch deaktiviert (keine E-Mail-Adressen vorhanden)"
+                )
+                SnackbarManager.showInfo("SMS-E-Mail-Weiterleitung wurde deaktiviert, da keine E-Mail-Adressen mehr vorhanden sind")
+            }
+
+            LoggingManager.log(
+                LoggingHelper.LogLevel.INFO,
+                LoggingHelper.LogMetadata(
+                    component = "ContactsViewModel",
+                    action = "REMOVE_EMAIL",
+                    details = mapOf(
+                        "remaining_emails" to currentList.size,
+                        "forwarding_status" to _forwardSmsToEmail.value
+                    )
+                ),
+                "E-Mail-Adresse entfernt"
+            )
+            SnackbarManager.showSuccess("E-Mail-Adresse entfernt")
+        }
+    }
+
+    // Neue Methode zum Aktualisieren des Test-Email-Texts
+    fun updateTestEmailText(newText: String) {
+        _testEmailText.value = newText
+        prefsManager.saveTestEmailText(newText)
+
+        LoggingManager.log(
+            LoggingHelper.LogLevel.DEBUG,
+            LoggingHelper.LogMetadata(
+                component = "ContactsViewModel",
+                action = "UPDATE_TEST_EMAIL",
+                details = mapOf(
+                    "old_length" to _testEmailText.value.length,
+                    "new_length" to newText.length,
+                    "is_empty" to newText.isEmpty()
+                )
+            ),
+            "Test-Email Text aktualisiert"
+        )
+    }
+
+
+fun updateSmtpSettings(
+        host: String,
+        port: Int,
+        username: String,
+        password: String
+    ) {
+        _smtpHost.value = host
+        _smtpPort.value = port
+        _smtpUsername.value = username
+        _smtpPassword.value = password
+        prefsManager.saveSmtpSettings(host, port, username, password)
+    }
+
+    // In ContactsViewModel.kt, neue Funktion hinzufügen:
+    // In ContactsViewModel.kt
+
+    fun sendTestEmail(mailrecipent: String) {
+        viewModelScope.launch {
+            try {
+                // Hole SMTP-Einstellungen aus SharedPreferences
+                val host = prefsManager.getSmtpHost()
+                val port = prefsManager.getSmtpPort()
+                val username = prefsManager.getSmtpUsername()
+                val password = prefsManager.getSmtpPassword()
+                val testEmailText = prefsManager.getTestEmailText()
+
+                // Prüfe ob alle erforderlichen SMTP-Einstellungen vorhanden sind
+                if (host.isEmpty() || username.isEmpty() || password.isEmpty()) {
+                    LoggingManager.log(
+                        LoggingHelper.LogLevel.WARNING,
+                        LoggingHelper.LogMetadata(
+                            component = "ContactsViewModel",
+                            action = "TEST_EMAIL",
+                            details = mapOf(
+                                "error" to "incomplete_smtp_settings",
+                                "has_host" to host.isNotEmpty(),
+                                "has_username" to username.isNotEmpty()
+                            )
+                        ),
+                        "Unvollständige SMTP-Einstellungen"
+                    )
+                    SnackbarManager.showError("SMTP-Einstellungen sind unvollständig")
+                    return@launch
+                }
+
+                val emailSender = EmailSender(host, port, username, password)
+
+                // Erstelle formatierten Email-Text mit Timestamp
+                val emailBody = buildString {
+                    append("Test-Email von SMS Forwarder\n\n")
+                    append("Zeitpunkt: ${getCurrentTimestamp()}\n\n")
+                    append("Nachricht:\n")
+                    append(testEmailText)
+                    append("\n\nDies ist eine Test-Email zur Überprüfung der Email-Weiterleitungsfunktion.")
+                }
+
+                when (val result = emailSender.sendEmail(
+                    to = listOf(mailrecipent),
+                    subject = "SMS Forwarder Test E-Mail",
+                    body = emailBody
+                )) {
+                    is EmailResult.Success -> {
+                        LoggingManager.log(
+                            LoggingHelper.LogLevel.INFO,
+                            LoggingHelper.LogMetadata(
+                                component = "ContactsViewModel",
+                                action = "TEST_EMAIL_SENT",
+                                details = mapOf(
+                                    "recipient" to mailrecipent,
+                                    "smtp_host" to host,
+                                    "text_length" to testEmailText.length
+                                )
+                            ),
+                            "Test-E-Mail wurde versendet"
+                        )
+                        SnackbarManager.showSuccess("Test-E-Mail wurde an $mailrecipent versendet")
+                    }
+                    is EmailResult.Error -> {
+                        LoggingManager.log(
+                            LoggingHelper.LogLevel.ERROR,
+                            LoggingHelper.LogMetadata(
+                                component = "ContactsViewModel",
+                                action = "TEST_EMAIL_FAILED",
+                                details = mapOf(
+                                    "error" to result.message,
+                                    "smtp_host" to host,
+                                    "recipient" to mailrecipent
+                                )
+                            ),
+                            "Fehler beim Versenden der Test-E-Mail"
+                        )
+                        SnackbarManager.showError("E-Mail-Versand fehlgeschlagen: ${result.message}")
+                    }
+                }
+            } catch (e: Exception) {
+                LoggingManager.log(
+                    LoggingHelper.LogLevel.ERROR,
+                    LoggingHelper.LogMetadata(
+                        component = "ContactsViewModel",
+                        action = "TEST_EMAIL_ERROR",
+                        details = mapOf(
+                            "error" to e.message,
+                            "recipient" to mailrecipent
+                        )
+                    ),
+                    "Unerwarteter Fehler beim E-Mail-Versand"
+                )
+                SnackbarManager.showError("E-Mail-Versand fehlgeschlagen: ${e.message}")
+            }
+        }
+    }
+
+    private fun getCurrentTimestamp(): String {
+        val dateFormat = SimpleDateFormat("dd.MM.yyyy HH:mm:ss", Locale.getDefault())
+        return dateFormat.format(Date())
+    }
     @VisibleForTesting
     fun setTestContacts(contacts: List<Contact>) = viewModelScope.launch {
         // Warten bis der Store initialisiert ist
@@ -354,6 +582,7 @@ class ContactsViewModel(
                 .collect { filterText ->
                     applyCurrentFilter()
                 }
+            _emailAddresses.value = prefsManager.getEmailAddresses()
         }
     }
 
@@ -598,6 +827,10 @@ class ContactsViewModel(
             }
             _forwardingActive.value = prefsManager.isForwardingActive()
             updateForwardingStatus(prefsManager.isForwardingActive())
+            _emailAddresses.value = prefsManager.getEmailAddresses()
+            _forwardSmsToEmail.value = prefsManager.isForwardSmsToEmail()
+
+
             LoggingManager.log(
                 LoggingHelper.LogLevel.INFO,
                 LoggingHelper.LogMetadata(
@@ -605,7 +838,9 @@ class ContactsViewModel(
                     action = "LOAD_STATE",
                     details = mapOf(
                         "has_saved_number" to (savedPhoneNumber != null),
-                        "forwarding_active" to prefsManager.isForwardingActive()
+                        "forwarding_active" to prefsManager.isForwardingActive(),
+                        "email_addresses_count" to _emailAddresses.value.size,
+                        "sms_to_email_active" to _forwardSmsToEmail.value
                     )
                 ),
                 "Gespeicherter App-Zustand geladen"
@@ -628,6 +863,8 @@ class ContactsViewModel(
             }
             prefsManager.saveFilterText(_filterText.value)
             prefsManager.saveTestSmsText(_testSmsText.value)
+            prefsManager.saveEmailAddresses(_emailAddresses.value)
+            prefsManager.setForwardSmsToEmail(_forwardSmsToEmail.value)
 
             LoggingManager.log(
                 LoggingHelper.LogLevel.INFO,
@@ -637,7 +874,9 @@ class ContactsViewModel(
                     details = mapOf(
                         "has_selected_contact" to (_selectedContact.value != null),
                         "forwarding_active" to forwardingActive.value,
-                        "filter_text_length" to filterText.value.length
+                        "filter_text_length" to filterText.value.length,
+                        "email_addresses_count" to _emailAddresses.value.size,
+                        "sms_to_email_active" to _forwardSmsToEmail.value
                     )
                 ),
                 "App-Zustand gespeichert"
@@ -937,13 +1176,41 @@ SnackbarManager.showError("Eigenweiterleitung nicht möglich")
         }
     }
 
-    /**
-     * Aktualisiert den Status der Weiterleitung.
-     */
-    fun updateForwardingStatus(active: Boolean) {
+    // Bei Änderungen am Weiterleitungsstatus
+    private fun updateForwardingStatus(active: Boolean) {
         _forwardingActive.value = active
         prefsManager.saveForwardingStatus(active)
-  }
+        updateServiceNotification()
+    }
+
+    // Bei Änderungen am Email-Weiterleitungsstatus
+    fun updateForwardSmsToEmail(enabled: Boolean) {
+        _forwardSmsToEmail.value = enabled
+        prefsManager.setForwardSmsToEmail(enabled)
+        updateServiceNotification()
+    }
+
+    private fun updateServiceNotification() {
+        val context = getApplication<Application>()
+        val status = buildString {
+            if (forwardingActive.value) {
+                append("SMS-Weiterleitung aktiv")
+                selectedContact.value?.let { contact ->
+                    append(" zu ${contact.name}")
+                }
+            }
+            if (forwardSmsToEmail.value) {
+                if (forwardingActive.value) append("\n")
+                append("Email-Weiterleitung aktiv")
+                val emailCount = _emailAddresses.value.size
+                append(" an $emailCount Email(s)")
+            }
+            if (!forwardingActive.value && !forwardSmsToEmail.value) {
+                append("Keine Weiterleitung aktiv")
+            }
+        }
+        SmsForegroundService.updateNotification(context, status)
+    }
 
     /**
      * Sendet eine Test-SMS.
@@ -1600,11 +1867,47 @@ data class Contact(
 
 class SharedPreferencesManager(private val context: Context) {
     private var prefs: SharedPreferences
-    private val logger = Logger(context)
-    //private val loggingHelper = LoggingHelper(logger)
 
     init {
         prefs = initializePreferences()
+    }
+
+    fun saveTestEmailText(text: String) {
+        safePreferencesOperation {
+            prefs.edit().putString(KEY_TEST_EMAIL_TEXT, text).apply()
+        }
+    }
+
+    fun getTestEmailText(): String {
+        return try {
+            prefs.getString(KEY_TEST_EMAIL_TEXT, "Das ist eine Test-Email.") ?: "Das ist eine Test-Email."
+        } catch (e: Exception) {
+            handlePreferencesError(e)
+            prefs = initializePreferences()
+            prefs.getString(KEY_TEST_EMAIL_TEXT, "Das ist eine Test-Email.") ?: "Das ist eine Test-Email."
+        }
+    }
+
+    fun setForwardSmsToEmail(enabled: Boolean) {
+        prefs.edit().putBoolean(KEY_FORWARD_SMS_TO_EMAIL, enabled).apply()
+    }
+
+    fun isForwardSmsToEmail(): Boolean {
+        return prefs.getBoolean(KEY_FORWARD_SMS_TO_EMAIL, false)
+    }
+
+    fun getEmailAddresses(): List<String> {
+        val emailsString = prefs.getString(KEY_EMAIL_ADDRESSES, "")
+        return if (emailsString.isNullOrEmpty()) {
+            emptyList()
+        } else {
+            emailsString.split(",").filter { it.isNotEmpty() }
+        }
+    }
+
+    fun saveEmailAddresses(emails: List<String>) {
+        val emailsString = emails.joinToString(",")
+        prefs.edit().putString(KEY_EMAIL_ADDRESSES, emailsString).apply()
     }
 
     private fun initializePreferences(): SharedPreferences {
@@ -1682,48 +1985,6 @@ class SharedPreferencesManager(private val context: Context) {
         }
     }
 
-    private fun migrateToNewPreferences() {
-        try {
-            val oldPrefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-            val editor = prefs.edit()
-
-            // Migriere alle vorhandenen Werte
-            oldPrefs.all.forEach { (key, value) ->
-                when (value) {
-                    is String -> editor.putString(key, value)
-                    is Boolean -> editor.putBoolean(key, value)
-                    is Int -> editor.putInt(key, value)
-                    is Long -> editor.putLong(key, value)
-                    is Float -> editor.putFloat(key, value)
-                }
-            }
-            editor.apply()
-
-            // Lösche alte Preferences nach erfolgreicher Migration
-            oldPrefs.edit().clear().apply()
-
-            LoggingManager.log(
-                LoggingHelper.LogLevel.INFO,
-                LoggingHelper.LogMetadata(
-                    component = "SharedPreferencesManager",
-                    action = "MIGRATION",
-                    details = mapOf("status" to "success")
-                ),
-                "Preferences erfolgreich migriert"
-            )
-        } catch (e: Exception) {
-            LoggingManager.log(
-                LoggingHelper.LogLevel.ERROR,
-                LoggingHelper.LogMetadata(
-                    component = "SharedPreferencesManager",
-                    action = "MIGRATION",
-                    details = mapOf("error" to e.message)
-                ),
-                "Fehler bei der Preferences-Migration"
-            )
-        }
-    }
-
     private fun safePreferencesOperation(operation: () -> Unit) {
         try {
             operation()
@@ -1764,21 +2025,12 @@ class SharedPreferencesManager(private val context: Context) {
         }
     }
 
+
     fun saveCountryCode(code: String) {
         if (isValidCountryCode(code)) {
             safePreferencesOperation {
                 prefs.edit().putString(KEY_COUNTRY_CODE, code).apply()
             }
-        }
-    }
-
-    fun getCountryCode(): String {
-        return try {
-            prefs.getString(KEY_COUNTRY_CODE, DEFAULT_COUNTRY_CODE) ?: DEFAULT_COUNTRY_CODE
-        } catch (e: Exception) {
-            handlePreferencesError(e)
-            prefs = initializePreferences()
-            prefs.getString(KEY_COUNTRY_CODE, DEFAULT_COUNTRY_CODE) ?: DEFAULT_COUNTRY_CODE
         }
     }
 
@@ -1902,7 +2154,28 @@ class SharedPreferencesManager(private val context: Context) {
         }
     }
 
+    fun saveSmtpSettings(host: String, port: Int, username: String, password: String) {
+        safePreferencesOperation {
+            prefs.edit().apply {
+                putString(KEY_SMTP_HOST, host)
+                putInt(KEY_SMTP_PORT, port)
+                putString(KEY_SMTP_USERNAME, username)
+                putString(KEY_SMTP_PASSWORD, password)
+                apply()
+            }
+        }
+    }
+
+    fun getSmtpHost(): String = prefs.getString(KEY_SMTP_HOST, DEFAULT_SMTP_HOST) ?: DEFAULT_SMTP_HOST
+    fun getSmtpPort(): Int = prefs.getInt(KEY_SMTP_PORT, DEFAULT_SMTP_PORT)
+    fun getSmtpUsername(): String = prefs.getString(KEY_SMTP_USERNAME, "") ?: ""
+    fun getSmtpPassword(): String = prefs.getString(KEY_SMTP_PASSWORD, "") ?: ""
+
+
     companion object {
+        private const val KEY_TEST_EMAIL_TEXT = "test_email_text"
+        private const val KEY_FORWARD_SMS_TO_EMAIL = "forward_sms_to_email"
+        private const val KEY_EMAIL_ADDRESSES = "email_addresses"
         private const val PREFS_NAME = "SMSForwarderEncryptedPrefs"
         private const val PREFS_NAME_FALLBACK = "SMSForwarderPrefs"
         private const val KEY_SELECTED_PHONE = "selected_phone_number"
@@ -1915,6 +2188,14 @@ class SharedPreferencesManager(private val context: Context) {
         private const val KEY_COUNTRY_CODE = "country_code"
         private const val DEFAULT_COUNTRY_CODE = "+43" // Österreich als Default
         private const val KEY_KEEP_FORWARDING_ON_EXIT = "keep_forwarding_on_exit"
+        private const val KEY_SMTP_HOST = "smtp_host"
+        private const val KEY_SMTP_PORT = "smtp_port"
+        private const val KEY_SMTP_USERNAME = "smtp_username"
+        private const val KEY_SMTP_PASSWORD = "smtp_password"
+
+        // Default-Werte
+        private const val DEFAULT_SMTP_HOST = "smtp.gmail.com"
+        private const val DEFAULT_SMTP_PORT = 587
     }
 }
 
@@ -1923,86 +2204,157 @@ class PreferencesInitializationException(message: String, cause: Throwable? = nu
 class PermissionHandler(private val activity: Activity) {
 
     // Erforderliche Berechtigungen für die App
-    val requiredPermissions = arrayOf(
-        android.Manifest.permission.READ_CONTACTS,
-        android.Manifest.permission.RECEIVE_SMS,
-        android.Manifest.permission.SEND_SMS,
-        android.Manifest.permission.CALL_PHONE,
-        android.Manifest.permission.READ_PHONE_STATE,
-        android.Manifest.permission.READ_PHONE_NUMBERS
-    )
+    val requiredPermissions = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+        arrayOf(
+            android.Manifest.permission.READ_CONTACTS,
+            android.Manifest.permission.RECEIVE_SMS,
+            android.Manifest.permission.SEND_SMS,
+            android.Manifest.permission.CALL_PHONE,
+            android.Manifest.permission.READ_PHONE_STATE,
+            android.Manifest.permission.READ_PHONE_NUMBERS,
+            android.Manifest.permission.POST_NOTIFICATIONS  // Neue Berechtigung für Benachrichtigungen
+        )
+    } else {
+        arrayOf(
+            android.Manifest.permission.READ_CONTACTS,
+            android.Manifest.permission.RECEIVE_SMS,
+            android.Manifest.permission.SEND_SMS,
+            android.Manifest.permission.CALL_PHONE,
+            android.Manifest.permission.READ_PHONE_STATE,
+            android.Manifest.permission.READ_PHONE_NUMBERS
+        )
+    }
     //private lateinit var permissionHandler: PermissionHandler
 
     private lateinit var requestPermissionLauncher: ActivityResultLauncher<Array<String>>
     private var isBatteryOptimizationRequested = false
-
-    // Callback für das Ergebnis der Berechtigungsanfrage
     private var onPermissionsResult: ((Boolean) -> Unit)? = null
 
-    // Initialisierung des PermissionHandlers
     fun initialize(launcher: ActivityResultLauncher<Array<String>>) {
         requestPermissionLauncher = launcher
     }
 
-    // Prüft und fordert Berechtigungen an
     fun checkAndRequestPermissions(onResult: (Boolean) -> Unit) {
         onPermissionsResult = onResult
+
+        // Zuerst prüfen wir die normalen Berechtigungen
         if (allPermissionsGranted()) {
             requestBatteryOptimization()
             onResult(true)
         } else {
+            LoggingManager.logInfo(
+                component = "PermissionHandler",
+                action = "REQUEST_PERMISSIONS",
+                message = "Fordere fehlende Berechtigungen an",
+                details = mapOf(
+                    "missing_permissions" to getMissingPermissions().joinToString()
+                )
+            )
             requestPermissions()
         }
     }
 
-    // Prüft, ob alle erforderlichen Berechtigungen erteilt wurden
+    private fun getMissingPermissions(): List<String> {
+        return requiredPermissions.filter {
+            ContextCompat.checkSelfPermission(activity, it) != PackageManager.PERMISSION_GRANTED
+        }
+    }
+
     private fun allPermissionsGranted() = requiredPermissions.all {
         ContextCompat.checkSelfPermission(activity, it) == PackageManager.PERMISSION_GRANTED
     }
 
-    // Fordert die Berechtigungen an
     private fun requestPermissions() {
         requestPermissionLauncher.launch(requiredPermissions)
     }
 
-    // Behandelt das Ergebnis der Berechtigungsanfrage
     fun onRequestPermissionsResult(granted: Boolean) {
         if (granted) {
             requestBatteryOptimization()
+            LoggingManager.logInfo(
+                component = "PermissionHandler",
+                action = "PERMISSIONS_GRANTED",
+                message = "Alle Berechtigungen wurden erteilt"
+            )
         } else {
+            LoggingManager.logWarning(
+                component = "PermissionHandler",
+                action = "PERMISSIONS_DENIED",
+                message = "Nicht alle Berechtigungen wurden erteilt",
+                details = mapOf(
+                    "missing_permissions" to getMissingPermissions().joinToString()
+                )
+            )
             showPermissionRequiredDialog()
         }
         onPermissionsResult?.invoke(granted)
     }
 
-    // Fordert die Batterieoptimierung an
     @SuppressLint("BatteryLife")
     private fun requestBatteryOptimization() {
         if (!isBatteryOptimizationRequested) {
             val packageName = activity.packageName
             val pm = activity.getSystemService(Context.POWER_SERVICE) as PowerManager
             if (!pm.isIgnoringBatteryOptimizations(packageName)) {
-                val intent = Intent().apply {
-                    action = Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS
-                    data = Uri.parse("package:$packageName")
+                try {
+                    val intent = Intent().apply {
+                        action = Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS
+                        data = Uri.parse("package:$packageName")
+                    }
+                    isBatteryOptimizationRequested = true
+                    activity.startActivity(intent)
+
+                    LoggingManager.logInfo(
+                        component = "PermissionHandler",
+                        action = "BATTERY_OPTIMIZATION",
+                        message = "Batterie-Optimierung-Dialog angezeigt"
+                    )
+                } catch (e: Exception) {
+                    LoggingManager.logError(
+                        component = "PermissionHandler",
+                        action = "BATTERY_OPTIMIZATION_ERROR",
+                        message = "Fehler beim Anzeigen des Batterie-Optimierung-Dialogs",
+                        error = e
+                    )
                 }
-                isBatteryOptimizationRequested = true
-                activity.startActivity(intent)
             }
         }
     }
 
-    // Zeigt einen Dialog an, wenn erforderliche Berechtigungen nicht erteilt wurden
+
+
+
     private fun showPermissionRequiredDialog() {
         AlertDialog.Builder(activity)
-            .setMessage("Die Berechtigungen sind für die App erforderlich. Die Ausführung wird beendet.")
+            .setTitle("Berechtigungen erforderlich")
+            .setMessage(
+                "Folgende Berechtigungen sind für die App erforderlich:\n\n" +
+                        "• Kontakte - Für die Auswahl des Weiterleitungsziels\n" +
+                        "• SMS - Zum Empfangen und Weiterleiten von Nachrichten\n" +
+                        "• Telefon - Für die Anrufweiterleitung\n" +
+                        (if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU)
+                            "• Benachrichtigungen - Für Status-Updates\n"
+                        else "") +
+                        "\nOhne diese Berechtigungen kann die App nicht funktionieren."
+            )
             .setCancelable(false)
-            .setPositiveButton("OK") { dialog, _ ->
+            .setPositiveButton("Zu den Einstellungen") { dialog, _ ->
+                dialog.dismiss()
+                openAppSettings()
+            }
+            .setNegativeButton("Beenden") { dialog, _ ->
                 dialog.dismiss()
                 activity.finish()
             }
             .create()
             .show()
+    }
+
+    private fun openAppSettings() {
+        val intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+            data = Uri.parse("package:${activity.packageName}")
+        }
+        activity.startActivity(intent)
     }
 }
 
@@ -2229,7 +2581,7 @@ class Logger(private val context: Context, private val maxEntries: Int = 1000) {
 
         logBuffer.asReversed().forEach { (timeStamp, text) ->
             val parts = timeStamp.split(" ")
-            val isSmsForward = text.contains("Weiterleitung")
+            val isSmsForward = text.contains("Weiterleitung") || text.contains("] SEND_SMS")
 
             val entryClass = if (isSmsForward) "entry-column sms-forward" else "entry-column"
 

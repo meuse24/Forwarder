@@ -15,6 +15,12 @@ import android.telephony.TelephonyManager
 import androidx.core.content.ContextCompat
 import com.google.i18n.phonenumbers.NumberParseException
 import com.google.i18n.phonenumbers.PhoneNumberUtil
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import javax.mail.*
+import javax.mail.internet.InternetAddress
+import javax.mail.internet.MimeMessage
+import java.util.Properties
 
 /**
  * PhoneSmsUtils ist eine Utility-Klasse für SMS- und Telefonie-bezogene Funktionen.
@@ -243,7 +249,8 @@ class PhoneSmsUtils private constructor() {
                         message ,
                         details = mapOf(
                             "recipient" to phoneNumber,
-                            "parts" to parts.size
+                            "parts" to parts.size,
+                            "text" to encodedText
                         )
                     )
                 } else {
@@ -271,7 +278,9 @@ class PhoneSmsUtils private constructor() {
                         component = "PhoneSmsUtils",
                         action = "SEND_SMS",
                         message ,
-                        details = mapOf("recipient" to phoneNumber)
+                        details = mapOf(
+                            "recipient" to phoneNumber,
+                            "text" to encodedText)
                     )
                 }
                 SnackbarManager.showSuccess("SMS wurde an $phoneNumber gesendet ($message).")
@@ -430,7 +439,7 @@ class PhoneSmsUtils private constructor() {
         }
 
 
-        @SuppressLint("MissingPermission")
+        @SuppressLint("MissingPermission", "ObsoleteSdkInt")
         fun getSimCardNumber(context: Context): String {
             if (!checkPermission(context, Manifest.permission.READ_PHONE_STATE) ||
                 !checkPermission(context, Manifest.permission.READ_PHONE_NUMBERS)
@@ -1379,5 +1388,75 @@ class SimStatusChecker(private val context: Context) {
         } catch (e: Exception) {
             false
         }
+    }
+}
+
+
+
+
+sealed class EmailResult {
+    object Success : EmailResult()
+    data class Error(val message: String) : EmailResult()
+}
+
+class EmailSender(
+    private val host: String,
+    private val port: Int,
+    private val username: String,
+    private val password: String
+) {
+    private val properties = Properties().apply {
+        put("mail.smtp.auth", "true")
+        put("mail.smtp.starttls.enable", "true")
+        put("mail.smtp.host", host)
+        put("mail.smtp.port", port)
+        put("mail.smtp.timeout", "10000")
+        put("mail.smtp.connectiontimeout", "10000")
+    }
+
+    private val session = Session.getInstance(properties, object : Authenticator() {
+        override fun getPasswordAuthentication(): PasswordAuthentication {
+            return PasswordAuthentication(username, password)
+        }
+    })
+
+    suspend fun sendEmail(
+        to: List<String>,
+        subject: String,
+        body: String
+    ): EmailResult = withContext(Dispatchers.IO) {
+        try {
+            // Validierung
+            if (to.isEmpty()) {
+                return@withContext EmailResult.Error("Keine Empfänger angegeben")
+            }
+
+            val message = MimeMessage(session).apply {
+                setFrom(InternetAddress(username))
+                setRecipients(
+                    Message.RecipientType.TO,
+                    to.map { InternetAddress(it) }.toTypedArray()
+                )
+                setSubject(subject, "UTF-8")
+                setText(body, "UTF-8")
+                sentDate = java.util.Date()
+            }
+
+            Transport.send(message)
+            EmailResult.Success
+
+        } catch (e: Exception) {
+            EmailResult.Error("Fehler beim E-Mail-Versand: ${e.message}")
+        }
+    }
+
+    companion object {
+        // Vordefinierte Konfigurationen für gängige Provider
+        fun createGmailSender(username: String, password: String) = EmailSender(
+            host = "smtp.gmail.com",
+            port = 587,
+            username = username,
+            password = password
+        )
     }
 }
