@@ -580,7 +580,7 @@ class MainActivity : ComponentActivity() {
                 )
             )
             viewModel.saveCurrentState()
-            viewModel.loadSavedState()
+            //viewModel.loadSavedState()
         } catch (e: UninitializedPropertyAccessException) {
             // ViewModel noch nicht initialisiert - ignorieren
             LoggingManager.logInfo(
@@ -2037,11 +2037,30 @@ class MainActivity : ComponentActivity() {
                         // Gmail-Standardwerte setzen
                         smtpHost = "smtp.gmail.com"
                         smtpPort = "587"
-                        smtpUsername = "guenther.meusburger.yt@gmail.com"
-                        smtpPassword = "hicz jipi vxyv dzml"
+                        //smtpUsername = "guenther.meusburger.yt@gmail.com"
+                        //smtpPassword = "hicz jipi vxyv dzml"
+                        smtpUsername = ""
+                        smtpPassword = ""
+                        SnackbarManager.showSuccess("Benutzername und App-spezifisches Passwort eingeben.")
+
+                    }
+
+                ) {
+                    Text("Gmail")
+                }
+
+                Button(
+                    onClick = {
+                        viewModel.updateSmtpSettings(
+                            "smtp.world4you.com",
+                             587,
+                            "smsfwd@meuse24.info",
+                            "V8Rv4TqM!5d8tEM"
+                        )
+                        SnackbarManager.showSuccess("Es wird ein meuse24-Mailserver verwendet (Verwendung ohne Gewähr!).")
                     }
                 ) {
-                    Text("Gmail-Standard")
+                    Text("Intern")
                 }
             }
 

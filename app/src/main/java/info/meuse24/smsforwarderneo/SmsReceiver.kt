@@ -15,14 +15,11 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
-import android.content.pm.PackageManager
-import android.content.res.Configuration
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.os.PowerManager
 import androidx.core.app.NotificationCompat
-import androidx.core.content.ContextCompat
 import androidx.lifecycle.AtomicReference
 import androidx.work.Worker
 import androidx.work.WorkerParameters
@@ -288,7 +285,6 @@ class SmsForegroundService : Service() {
     }
 
     companion object {
-        private const val TAG = "SmsForegroundService"
         private const val CHANNEL_ID = "SmsForwarderChannel"
         private const val NOTIFICATION_ID = 1
         private const val RESTART_DELAY = 1000L // 1 Sekunde
@@ -419,13 +415,8 @@ class SmsForegroundService : Service() {
         }
     }
 
-    override fun onConfigurationChanged(newConfig: Configuration) {
-        super.onConfigurationChanged(newConfig)
-        // Keine Neuerstellung der Notification notwendig
-    }
-
     private fun createNotificationChannel() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+
             try {
                 // Prüfe ob der Channel bereits existiert
                 val existingChannel = notificationManager.getNotificationChannel(CHANNEL_ID)
@@ -449,8 +440,9 @@ class SmsForegroundService : Service() {
                 ).apply {
                     description = "Zeigt den Status der SMS/Anruf-Weiterleitung an"
                     setShowBadge(true)
-                    enableLights(true)
-                    enableVibration(true)
+                    enableLights(false)
+                    enableVibration(false)  // Hier auf false gesetzt
+                    vibrationPattern = null // Optional: Vibrationsmuster explizit auf null setzen
                     lockscreenVisibility = Notification.VISIBILITY_PUBLIC
                 }
 
@@ -474,7 +466,6 @@ class SmsForegroundService : Service() {
                 )
             }
         }
-    }
 
     private fun createNotification(contentText: String): Notification {
         val notificationIntent = Intent(this, MainActivity::class.java).apply {
@@ -511,7 +502,7 @@ class SmsForegroundService : Service() {
             }
     }
 
-    fun updateNotification(contentText: String) {
+    private fun updateNotification(contentText: String) {
         try {
             if (isServiceRunning) {
                 currentNotificationText = contentText
@@ -530,17 +521,6 @@ class SmsForegroundService : Service() {
                 message = "Fehler beim Aktualisieren der Notification",
                 error = e
             )
-        }
-    }
-
-    private fun checkNotificationPermission() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            Log.d(TAG, "Notification permission: ${
-                ContextCompat.checkSelfPermission(
-                    this,
-                    android.Manifest.permission.POST_NOTIFICATIONS
-                ) == PackageManager.PERMISSION_GRANTED
-            }")
         }
     }
 
@@ -590,12 +570,7 @@ class SmsForegroundService : Service() {
 
     private fun restartService() {
         try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-                stopForeground(STOP_FOREGROUND_REMOVE)
-            } else {
-                @Suppress("DEPRECATION")
-                stopForeground(true)
-            }
+            stopForeground(STOP_FOREGROUND_REMOVE)
             startForegroundService()
         } catch (e: Exception) {
             LoggingManager.logError(
