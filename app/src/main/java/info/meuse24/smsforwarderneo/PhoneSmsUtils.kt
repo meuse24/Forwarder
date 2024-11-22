@@ -163,6 +163,7 @@ class PhoneSmsUtils private constructor() {
                 }
 
                 sendSms(context, phoneNumber, encodedText)
+
                 LoggingManager.logInfo(
                     component = "PhoneSmsUtils",
                     action = "SEND_TEST_SMS",
@@ -193,6 +194,11 @@ class PhoneSmsUtils private constructor() {
 
         @SuppressLint("NewApi")
         fun sendSms(context: Context, phoneNumber: String, text: String) {
+
+            if (phoneNumber.isBlank() || text.isBlank()) {
+                throw IllegalArgumentException("Phone number and text must not be empty")
+            }
+
             if (!checkPermission(context, Manifest.permission.SEND_SMS)) {
                 LoggingManager.logError(
                     component = "PhoneSmsUtils",

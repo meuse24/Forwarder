@@ -7,6 +7,12 @@ import androidx.compose.material3.SnackbarDuration
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.SnackbarResult
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 
 
@@ -17,14 +23,31 @@ class SmsForwarderApplication : Application() {
     lateinit var loggingHelper: LoggingHelper
         private set
 
+    private val _isReady = MutableStateFlow(false)
+    val isReady: StateFlow<Boolean> = _isReady.asStateFlow()
+
+    private val applicationScope = CoroutineScope(Job() + Dispatchers.Default)
+
     override fun onCreate() {
         super.onCreate()
         instance = this
 
-        initializeLogging()
+        // Starte Initialisierung in einer Coroutine
+        applicationScope.launch {
+            try {
+                initializeLogging()
+                _isReady.value = true
+            } catch (e: Exception) {
+                Log.e("Application", "Fehler bei der Initialisierung", e)
+            }
+        }
     }
 
-    private fun initializeLogging() {
+    override fun onTerminate() {
+        super.onTerminate()
+        applicationScope.coroutineContext.cancel()
+    }
+    private  fun initializeLogging() {
         try {
             logger = Logger(this)
             loggingHelper = LoggingHelper(logger)
@@ -47,26 +70,34 @@ class SmsForwarderApplication : Application() {
 
     override fun onLowMemory() {
         super.onLowMemory()
-        LoggingManager.logWarning(
-            component = "Application",
-            action = "LOW_MEMORY",
-            message = "Gerät hat wenig Arbeitsspeicher",
-            details = mapOf(
-                "free_memory" to Runtime.getRuntime().freeMemory(),
-                "total_memory" to Runtime.getRuntime().totalMemory()
+
+        // Asynchrones Logging mit applicationScope
+
+            LoggingManager.logWarning(
+                component = "Application",
+                action = "LOW_MEMORY",
+                message = "Gerät hat wenig Arbeitsspeicher",
+                details = mapOf(
+                    "free_memory" to Runtime.getRuntime().freeMemory(),
+                    "total_memory" to Runtime.getRuntime().totalMemory()
+                )
             )
-        )
+
     }
 
     override fun onTrimMemory(level: Int) {
         super.onTrimMemory(level)
+
         if (level >= ComponentCallbacks2.TRIM_MEMORY_MODERATE) {
-            LoggingManager.logWarning(
-                component = "Application",
-                action = "TRIM_MEMORY",
-                message = "System fordert Speicherbereinigung an",
-                details = mapOf("level" to level)
-            )
+            // Asynchrones Logging im applicationScope
+
+                LoggingManager.logWarning(
+                    component = "Application",
+                    action = "TRIM_MEMORY",
+                    message = "System fordert Speicherbereinigung an",
+                    details = mapOf("level" to level)
+                )
+
         }
     }
 
@@ -85,20 +116,23 @@ class SmsForwarderApplication : Application() {
 }
 
 object LoggingManager {
-    //private val logger: Logger        get() = SmsForwarderApplication.getInstance().logger
+    private val scope = CoroutineScope(Job() + Dispatchers.Default)
+
 
     private val loggingHelper: LoggingHelper
         get() = SmsForwarderApplication.getInstance().loggingHelper
 
     // Allgemeine log-Funktion mit gleicher Signatur wie LoggingHelper
-    fun log(
+     fun log(
         level: LoggingHelper.LogLevel,
         metadata: LoggingHelper.LogMetadata,
         message: String,
         throwable: Throwable? = null
     ) {
         try {
-            loggingHelper.log(level, metadata, message, throwable)
+            scope.launch {
+                loggingHelper.log(level, metadata, message, throwable)
+            }
         } catch (e: Exception) {
             Log.e("LoggingManager", "Fehler beim Logging: ${e.message}", e)
         }
@@ -192,16 +226,6 @@ object SnackbarManager {
             synchronized(lock) {
                 snackbarHostState = hostState
                 coroutineScope = scope
-                LoggingManager.logDebug(
-                    component = "SnackbarManager",
-                    action = "SET_STATE",
-                    message = "Neuer SnackbarHostState registriert",
-                    details = mapOf(
-                        "pending_messages" to pendingMessages.size,
-                        "has_scope" to (true),
-                        "has_host_state" to (true)
-                    )
-                )
 
                 // Zeige ausstehende Nachrichten
                 if (pendingMessages.isNotEmpty()) {
@@ -221,17 +245,7 @@ object SnackbarManager {
                 val scope = coroutineScope
 
                 if (hostState == null || scope == null) {
-                    LoggingManager.logDebug(
-                        component = "SnackbarManager",
-                        action = "QUEUE_MESSAGE",
-                        message = "Nachricht wird zwischengespeichert",
-                        details = mapOf(
-                            "message" to config.message,
-                            "type" to config.type.name,
-                            "has_host_state" to (hostState != null),
-                            "has_scope" to (scope != null)
-                        )
-                    )
+
                     pendingMessages.add(config)
                     return
                 }

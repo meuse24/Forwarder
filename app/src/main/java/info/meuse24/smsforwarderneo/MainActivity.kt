@@ -6,8 +6,11 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.ActivityInfo
 import android.content.res.Configuration
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.PowerManager
+import android.provider.Settings
 import android.util.Log
 import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
@@ -41,19 +44,30 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ExitToApp
 import androidx.compose.material.icons.automirrored.filled.List
+import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Clear
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Email
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Share
+import androidx.compose.material.icons.filled.Textsms
+import androidx.compose.material.icons.filled.Visibility
+import androidx.compose.material.icons.filled.VisibilityOff
+import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.HorizontalDivider
@@ -62,6 +76,8 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
@@ -79,14 +95,20 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.FocusManager
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.luminance
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -102,86 +124,147 @@ import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
-import android.provider.Settings
-import android.net.Uri
-import android.os.PowerManager
-import androidx.compose.foundation.text.KeyboardActions
-import androidx.compose.foundation.text.KeyboardOptions
-import androidx.compose.material.icons.filled.Close
-import androidx.compose.material.icons.filled.Warning
-import androidx.compose.material3.ButtonDefaults
-import androidx.compose.material3.OutlinedTextField
-import androidx.compose.ui.text.input.KeyboardType
-import androidx.compose.ui.text.input.VisualTransformation
-import androidx.compose.ui.text.input.PasswordVisualTransformation
-import androidx.compose.material.icons.Icons  // Dies muss zuerst importiert werden
-import androidx.compose.material.icons.filled.Add
-import androidx.compose.material.icons.filled.Email
-import androidx.compose.material.icons.filled.Textsms
-import androidx.compose.material.icons.filled.Visibility
-import androidx.compose.material.icons.filled.VisibilityOff
-import androidx.compose.material3.OutlinedTextFieldDefaults
-import androidx.compose.ui.focus.FocusManager
-import androidx.compose.ui.platform.LocalConfiguration
-import androidx.compose.ui.text.input.ImeAction
 
 class MainActivity : ComponentActivity() {
+    private var _isInitialized = mutableStateOf(false)
     private lateinit var permissionHandler: PermissionHandler
+    private lateinit var logger: Logger
     private val viewModel: ContactsViewModel by lazy {
         ViewModelProvider(
             this,
             ContactsViewModelFactory(application, prefsManager, logger)
         )[ContactsViewModel::class.java]
     }
-    private lateinit var logger: Logger
+
     private lateinit var prefsManager: SharedPreferencesManager
-    private var _isInitialized = mutableStateOf(false)  // Neue State-Variable
 
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            registerActivityLifecycleCallbacks(object : Application.ActivityLifecycleCallbacks {
-                override fun onActivityCreated(activity: Activity, savedInstanceState: Bundle?) {
-                    activity.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
-                }
-                // Implementieren Sie die anderen Callbacks als leere Methoden
-                override fun onActivityStarted(activity: Activity) {}
-                override fun onActivityResumed(activity: Activity) {}
-                override fun onActivityPaused(activity: Activity) {}
-                override fun onActivityStopped(activity: Activity) {}
-                override fun onActivitySaveInstanceState(activity: Activity, outState: Bundle) {}
-                override fun onActivityDestroyed(activity: Activity) {}
-            })
+        val app = applicationContext as SmsForwarderApplication
+        if (app.isReady.value) {
+            // Wenn die App bereits bereit ist, direkt setupActivity aufrufen
+            setupActivity()
+        } else {
+            // Sonst auf Bereitschaft warten
+            lifecycleScope.launch {
+                app.isReady.first { it }
+                setupActivity()
+            }
         }
 
+//        logger = (applicationContext as SmsForwarderApplication).logger
+//
+//        registerActivityLifecycleCallbacks(object : Application.ActivityLifecycleCallbacks {
+//            override fun onActivityCreated(activity: Activity, savedInstanceState: Bundle?) {
+//                activity.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+//            }
+
+//            // Implementieren Sie die anderen Callbacks als leere Methoden
+//            override fun onActivityStarted(activity: Activity) {}
+//            override fun onActivityResumed(activity: Activity) {}
+//            override fun onActivityPaused(activity: Activity) {}
+//            override fun onActivityStopped(activity: Activity) {}
+//            override fun onActivitySaveInstanceState(activity: Activity, outState: Bundle) {}
+//            override fun onActivityDestroyed(activity: Activity) {}
+//        })
+
+//
+//
+//        prefsManager = SharedPreferencesManager(this)
+//
+//        permissionHandler = PermissionHandler(this)
+//        val requestPermissionLauncher = registerForActivityResult(
+//            ActivityResultContracts.RequestMultiplePermissions()
+//        ) { permissions ->
+//            val allGranted = permissions.all { it.value }
+//            handlePermissionResult(allGranted)
+//        }
+//        permissionHandler.initialize(requestPermissionLauncher)
+//
+//        setContent {
+//            val isInitialized by remember { _isInitialized }  // State für Compose
+//            var showPermissionDialog by remember { mutableStateOf(false) }
+//            var isLoading by remember { mutableStateOf(true) }
+//            var errorState by remember { mutableStateOf<String?>(null) }
+//
+//            LaunchedEffect(Unit) {
+//                checkAndRequestPermissions { granted ->
+//                    if (!granted) {
+//                        showPermissionDialog = true
+//                    } else {
+//                        try {
+//                            initializeAfterPermissions()
+//                            _isInitialized.value = true  // Update Compose State
+//                            isLoading = false
+//                        } catch (e: Exception) {
+//                            errorState = e.message ?: "Unbekannter Fehler"
+//                            isLoading = false
+//                        }
+//                    }
+//                }
+//            }
+//
+//            when {
+//                showPermissionDialog -> {
+//                    PermissionRequiredDialog(
+//                        onOpenSettings = {
+//                            showPermissionDialog = false
+//                            openAppSettings()
+//                        },
+//                        onDismiss = {
+//                            showPermissionDialog = false
+//                            finish()
+//                        }
+//                    )
+//                }
+//
+//                !isInitialized -> {
+//                    LoadingScreen(
+//                        isLoading = isLoading,
+//                        error = errorState,
+//                    )
+//                }
+//
+//                else -> {
+//                    UI(viewModel)
+//                }
+//            }
+//        }
+//        SmsForegroundService.startService(this)
+
+    }
+
+    private fun setupActivity() {
         logger = (applicationContext as SmsForwarderApplication).logger
         prefsManager = SharedPreferencesManager(this)
-
         permissionHandler = PermissionHandler(this)
+
         val requestPermissionLauncher = registerForActivityResult(
             ActivityResultContracts.RequestMultiplePermissions()
         ) { permissions ->
-            val allGranted = permissions.all { it.value }
-            handlePermissionResult(allGranted)
+            handlePermissionResult(permissions.all { it.value })
         }
         permissionHandler.initialize(requestPermissionLauncher)
 
         setContent {
-            val isInitialized by remember { _isInitialized }  // State für Compose
+            val isInitialized by remember { _isInitialized }
             var showPermissionDialog by remember { mutableStateOf(false) }
-            var isLoading by remember { mutableStateOf(true) }
+            var isLoading by remember { mutableStateOf(false) } // Starte ohne Loading
             var errorState by remember { mutableStateOf<String?>(null) }
 
             LaunchedEffect(Unit) {
+                isLoading = true // Aktiviere Loading erst hier
                 checkAndRequestPermissions { granted ->
                     if (!granted) {
                         showPermissionDialog = true
+                        isLoading = false
                     } else {
                         try {
                             initializeAfterPermissions()
-                            _isInitialized.value = true  // Update Compose State
+                            _isInitialized.value = true
+                            SmsForegroundService.startService(this@MainActivity)
                             isLoading = false
                         } catch (e: Exception) {
                             errorState = e.message ?: "Unbekannter Fehler"
@@ -204,18 +287,21 @@ class MainActivity : ComponentActivity() {
                         }
                     )
                 }
+
                 !isInitialized -> {
                     LoadingScreen(
                         isLoading = isLoading,
                         error = errorState,
                     )
                 }
+
                 else -> {
                     UI(viewModel)
                 }
             }
         }
         SmsForegroundService.startService(this)
+
 
     }
 
@@ -277,9 +363,10 @@ class MainActivity : ComponentActivity() {
             if (!pm.isIgnoringBatteryOptimizations(packageName)) {
                 lifecycleScope.launch {
                     try {
-                        val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
-                            data = Uri.parse("package:$packageName")
-                        }
+                        val intent =
+                            Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
+                                data = Uri.parse("package:$packageName")
+                            }
                         startActivity(intent)
                     } catch (e: Exception) {
                         LoggingManager.logError(
@@ -299,7 +386,7 @@ class MainActivity : ComponentActivity() {
 
             PhoneSmsUtils.initialize()
             checkSimStatusAndProceed()
-            viewModel.loadSavedState()
+            //viewModel.loadSavedState()
             viewModel.loadOwnPhoneNumberIfEmpty(this)
             setupBackHandler()
             SmsForegroundService.startService(this)
@@ -593,7 +680,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onDestroy() {
         //viewModel.deactivateForwarding()
-        viewModel.saveCurrentState() // Neue Methode, die wir im ViewModel hinzufügen werden
+        //viewModel.saveCurrentState() // Neue Methode, die wir im ViewModel hinzufügen werden
         LoggingManager.logInfo(
             component = "MainActivity",
             action = "DESTROY",
@@ -617,7 +704,8 @@ class MainActivity : ComponentActivity() {
             message = "Kritischer Fehler: $title - $message",
             details = mapOf(
                 "errorTitle" to title,
-                "errorMessage" to message  )
+                "errorMessage" to message
+            )
         )
         setContent {
             AlertDialog(
@@ -928,8 +1016,10 @@ class MainActivity : ComponentActivity() {
         val (title, message) = when (error) {
             is ContactsViewModel.ErrorDialogState.DeactivationError ->
                 Pair("Deaktivierung fehlgeschlagen", error.message)
+
             is ContactsViewModel.ErrorDialogState.TimeoutError ->
                 Pair("Zeitüberschreitung", "Die Deaktivierung der Weiterleitung dauert zu lange.")
+
             is ContactsViewModel.ErrorDialogState.GeneralError ->
                 Pair("Fehler", "Ein unerwarteter Fehler ist aufgetreten: ${error.error.message}")
         }
@@ -1003,18 +1093,22 @@ class MainActivity : ComponentActivity() {
                                 Icons.Filled.Settings,
                                 contentDescription = "Setup"
                             )
+
                             "mail" -> Icon(
                                 Icons.Filled.Email,
                                 contentDescription = "Mail"
                             )
+
                             "log" -> Icon(
                                 Icons.AutoMirrored.Filled.List,
                                 contentDescription = "Log"
                             )
+
                             "info" -> Icon(
                                 Icons.Filled.Info,
                                 contentDescription = "Info"
                             )
+
                             else -> Icon(
                                 Icons.Filled.Home,
                                 contentDescription = "Start"
@@ -1022,13 +1116,15 @@ class MainActivity : ComponentActivity() {
                         }
                     },
                     label = {
-                        Text(when (screen) {
-                            "start" -> "Start"
-                            "mail" -> "Mail"
-                            "setup" -> "Setup"
-                            "log" -> "Log"
-                            else -> "Info"
-                        })
+                        Text(
+                            when (screen) {
+                                "start" -> "Start"
+                                "mail" -> "Mail"
+                                "setup" -> "Setup"
+                                "log" -> "Log"
+                                else -> "Info"
+                            }
+                        )
                     },
                     selected = currentRoute == screen,
                     onClick = {
@@ -1512,40 +1608,39 @@ class MainActivity : ComponentActivity() {
         ) {
 
 
-
-                // Checkbox mit deaktiviertem Zustand wenn keine E-Mails vorhanden
-                Surface(
-                    modifier = Modifier.fillMaxWidth(),
-                    shape = MaterialTheme.shapes.small,
-                    color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.3f)
+            // Checkbox mit deaktiviertem Zustand wenn keine E-Mails vorhanden
+            Surface(
+                modifier = Modifier.fillMaxWidth(),
+                shape = MaterialTheme.shapes.small,
+                color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.3f)
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp, vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(horizontal = 16.dp, vertical = 8.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Checkbox(
-                            checked = forwardSmsToEmail,
-                            onCheckedChange = { checked ->
-                                if (emailAddresses.isNotEmpty()) {
-                                    viewModel.updateForwardSmsToEmail(checked)
-                                } else if (checked) {
-                                    SnackbarManager.showWarning("Bitte fügen Sie zuerst E-Mail-Adressen hinzu")
-                                }
-                            },
-                            enabled = emailAddresses.isNotEmpty()
-                        )
-                        Spacer(modifier = Modifier.width(8.dp))
-                        Text(
-                            text = "SMS an alle E-Mails weiterleiten",
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = if (emailAddresses.isNotEmpty())
-                                MaterialTheme.colorScheme.onSurface
-                            else
-                                MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f)
-                        )
-                    }
+                    Checkbox(
+                        checked = forwardSmsToEmail,
+                        onCheckedChange = { checked ->
+                            if (emailAddresses.isNotEmpty()) {
+                                viewModel.updateForwardSmsToEmail(checked)
+                            } else if (checked) {
+                                SnackbarManager.showWarning("Bitte fügen Sie zuerst E-Mail-Adressen hinzu")
+                            }
+                        },
+                        enabled = emailAddresses.isNotEmpty()
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(
+                        text = "SMS an alle E-Mails weiterleiten",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = if (emailAddresses.isNotEmpty())
+                            MaterialTheme.colorScheme.onSurface
+                        else
+                            MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f)
+                    )
+                }
 
             }
 
@@ -1868,7 +1963,12 @@ class MainActivity : ComponentActivity() {
         var isTestEmailTextFocused by remember { mutableStateOf(false) } // Neue State
         var isTopBarTitleFocused by remember { mutableStateOf(false) }
 
-        LaunchedEffect(isFilterTextFocused, isTestSmsTextFocused, isTestEmailTextFocused, isTopBarTitleFocused) {
+        LaunchedEffect(
+            isFilterTextFocused,
+            isTestSmsTextFocused,
+            isTestEmailTextFocused,
+            isTopBarTitleFocused
+        ) {
             onFocusChanged(isFilterTextFocused || isTestSmsTextFocused || isTestEmailTextFocused || isTopBarTitleFocused)
         }
 
@@ -2053,7 +2153,7 @@ class MainActivity : ComponentActivity() {
                     onClick = {
                         viewModel.updateSmtpSettings(
                             "smtp.world4you.com",
-                             587,
+                            587,
                             "smsfwd@meuse24.info",
                             "V8Rv4TqM!5d8tEM"
                         )
@@ -2208,7 +2308,8 @@ class MainActivity : ComponentActivity() {
                                     details = mapOf(
                                         "errorCode" to (error?.errorCode ?: -1),
                                         "url" to (request?.url?.toString() ?: "unknown"),
-                                        "description" to (error?.description?.toString() ?: "unknown")
+                                        "description" to (error?.description?.toString()
+                                            ?: "unknown")
                                     )
                                 )
                             }
@@ -2351,18 +2452,22 @@ class MainActivity : ComponentActivity() {
 
     @Composable
     fun DeleteLogIconButton() {
+        val scope = rememberCoroutineScope()  // Hole CoroutineScope für Composables
+
         IconButton(
             onClick = {
-                logger.clearLog()
-                LoggingManager.logInfo(
-                    component = "LogScreen",
-                    action = "CLEAR_LOGS",
-                    message = "Log-Einträge wurden gelöscht",
-                    details = mapOf(
-                        "timestamp" to System.currentTimeMillis(),
-                        "userInitiated" to true
+                scope.launch {  // Starte Coroutine für suspend function
+                    logger.clearLog()
+                    LoggingManager.logInfo(
+                        component = "LogScreen",
+                        action = "CLEAR_LOGS",
+                        message = "Log-Einträge wurden gelöscht",
+                        details = mapOf(
+                            "timestamp" to System.currentTimeMillis(),
+                            "userInitiated" to true
+                        )
                     )
-                )
+                }
                 SnackbarManager.showSuccess("Logs wurden gelöscht")
             }
         ) {
