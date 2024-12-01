@@ -43,7 +43,7 @@ android {
         applicationId = "info.meuse24.smsforwarderneo"
         minSdk = 29
         targetSdk = 34
-        versionCode = 1
+        versionCode = 3
         versionName = "Anchovy"
 
         val agpVersion = Version.ANDROID_GRADLE_PLUGIN_VERSION
@@ -130,6 +130,7 @@ dependencies {
     implementation(libs.android.activation)
     implementation(libs.compose.icons.core)
     implementation(libs.compose.icons.extended)
+    implementation(libs.androidx.datastore.core.android)
     testImplementation(libs.junit)
 
     androidTestImplementation(libs.androidx.junit)

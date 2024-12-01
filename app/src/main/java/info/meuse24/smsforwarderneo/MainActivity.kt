@@ -1,25 +1,20 @@
 package info.meuse24.smsforwarderneo
 
-import android.app.Activity
-import android.app.Application
 import android.content.Context
 import android.content.Intent
-import android.content.pm.ActivityInfo
 import android.content.res.Configuration
-import android.net.Uri
+import android.icu.text.SimpleDateFormat
 import android.os.Build
 import android.os.Bundle
-import android.os.PowerManager
-import android.provider.Settings
 import android.util.Log
 import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.activity.ComponentActivity
-import androidx.activity.OnBackPressedCallback
+import androidx.activity.addCallback
 import androidx.activity.compose.setContent
-import androidx.activity.result.contract.ActivityResultContracts
+import androidx.activity.viewModels
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.tween
@@ -57,6 +52,7 @@ import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Email
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.Info
+import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Settings
@@ -94,8 +90,8 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.focus.FocusManager
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
@@ -104,6 +100,7 @@ import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
@@ -114,7 +111,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.window.DialogProperties
-import androidx.lifecycle.ViewModelProvider
+import androidx.core.content.FileProvider
 import androidx.lifecycle.lifecycleScope
 import androidx.navigation.NavController
 import androidx.navigation.NavGraph.Companion.findStartDestination
@@ -122,297 +119,122 @@ import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
+import info.meuse24.smsforwarderneo.AppContainer.prefsManager
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import java.io.File
+import java.util.Date
+import java.util.Locale
 
 class MainActivity : ComponentActivity() {
-    private var _isInitialized = mutableStateOf(false)
+    private val viewModel: ContactsViewModel by viewModels { ContactsViewModel.Factory() }
+    private val _isLoading = MutableStateFlow(true)
+    private val _loadingError = MutableStateFlow<String?>(null)
     private lateinit var permissionHandler: PermissionHandler
-    private lateinit var logger: Logger
-    private val viewModel: ContactsViewModel by lazy {
-        ViewModelProvider(
-            this,
-            ContactsViewModelFactory(application, prefsManager, logger)
-        )[ContactsViewModel::class.java]
-    }
-
-    private lateinit var prefsManager: SharedPreferencesManager
-
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        val app = applicationContext as SmsForwarderApplication
-        if (app.isReady.value) {
-            // Wenn die App bereits bereit ist, direkt setupActivity aufrufen
-            setupActivity()
-        } else {
-            // Sonst auf Bereitschaft warten
-            lifecycleScope.launch {
-                app.isReady.first { it }
-                setupActivity()
+        onBackPressedDispatcher.addCallback(this) {
+            // Prüfe ob irgendeine Art der Weiterleitung aktiv ist
+            if (viewModel.forwardingActive.value || viewModel.forwardSmsToEmail.value) {
+                // Zeige Exit-Dialog mit Optionen zum Deaktivieren/Beibehalten
+                viewModel.onShowExitDialog()
+            } else {
+                // Wenn keine Weiterleitung aktiv ist, beende direkt
+                finish()
             }
         }
 
-//        logger = (applicationContext as SmsForwarderApplication).logger
-//
-//        registerActivityLifecycleCallbacks(object : Application.ActivityLifecycleCallbacks {
-//            override fun onActivityCreated(activity: Activity, savedInstanceState: Bundle?) {
-//                activity.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
-//            }
-
-//            // Implementieren Sie die anderen Callbacks als leere Methoden
-//            override fun onActivityStarted(activity: Activity) {}
-//            override fun onActivityResumed(activity: Activity) {}
-//            override fun onActivityPaused(activity: Activity) {}
-//            override fun onActivityStopped(activity: Activity) {}
-//            override fun onActivitySaveInstanceState(activity: Activity, outState: Bundle) {}
-//            override fun onActivityDestroyed(activity: Activity) {}
-//        })
-
-//
-//
-//        prefsManager = SharedPreferencesManager(this)
-//
-//        permissionHandler = PermissionHandler(this)
-//        val requestPermissionLauncher = registerForActivityResult(
-//            ActivityResultContracts.RequestMultiplePermissions()
-//        ) { permissions ->
-//            val allGranted = permissions.all { it.value }
-//            handlePermissionResult(allGranted)
-//        }
-//        permissionHandler.initialize(requestPermissionLauncher)
-//
-//        setContent {
-//            val isInitialized by remember { _isInitialized }  // State für Compose
-//            var showPermissionDialog by remember { mutableStateOf(false) }
-//            var isLoading by remember { mutableStateOf(true) }
-//            var errorState by remember { mutableStateOf<String?>(null) }
-//
-//            LaunchedEffect(Unit) {
-//                checkAndRequestPermissions { granted ->
-//                    if (!granted) {
-//                        showPermissionDialog = true
-//                    } else {
-//                        try {
-//                            initializeAfterPermissions()
-//                            _isInitialized.value = true  // Update Compose State
-//                            isLoading = false
-//                        } catch (e: Exception) {
-//                            errorState = e.message ?: "Unbekannter Fehler"
-//                            isLoading = false
-//                        }
-//                    }
-//                }
-//            }
-//
-//            when {
-//                showPermissionDialog -> {
-//                    PermissionRequiredDialog(
-//                        onOpenSettings = {
-//                            showPermissionDialog = false
-//                            openAppSettings()
-//                        },
-//                        onDismiss = {
-//                            showPermissionDialog = false
-//                            finish()
-//                        }
-//                    )
-//                }
-//
-//                !isInitialized -> {
-//                    LoadingScreen(
-//                        isLoading = isLoading,
-//                        error = errorState,
-//                    )
-//                }
-//
-//                else -> {
-//                    UI(viewModel)
-//                }
-//            }
-//        }
-//        SmsForegroundService.startService(this)
-
-    }
-
-    private fun setupActivity() {
-        logger = (applicationContext as SmsForwarderApplication).logger
-        prefsManager = SharedPreferencesManager(this)
+        // Initialisiere PermissionHandler direkt
         permissionHandler = PermissionHandler(this)
 
-        val requestPermissionLauncher = registerForActivityResult(
-            ActivityResultContracts.RequestMultiplePermissions()
-        ) { permissions ->
-            handlePermissionResult(permissions.all { it.value })
-        }
-        permissionHandler.initialize(requestPermissionLauncher)
+        lifecycleScope.launch {
+            try {
+                // Warte auf Basis-Initialisierung
+                AppContainer.isBasicInitialized.first { it }
 
-        setContent {
-            val isInitialized by remember { _isInitialized }
-            var showPermissionDialog by remember { mutableStateOf(false) }
-            var isLoading by remember { mutableStateOf(false) } // Starte ohne Loading
-            var errorState by remember { mutableStateOf<String?>(null) }
+                // Führe Activity-Initialisierung durch
+                AppContainer.initializeWithActivity(this@MainActivity)
 
-            LaunchedEffect(Unit) {
-                isLoading = true // Aktiviere Loading erst hier
-                checkAndRequestPermissions { granted ->
-                    if (!granted) {
-                        showPermissionDialog = true
-                        isLoading = false
-                    } else {
-                        try {
-                            initializeAfterPermissions()
-                            _isInitialized.value = true
-                            SmsForegroundService.startService(this@MainActivity)
-                            isLoading = false
-                        } catch (e: Exception) {
-                            errorState = e.message ?: "Unbekannter Fehler"
-                            isLoading = false
-                        }
-                    }
-                }
-            }
+                // Setze Content
+                setContent {
+                    MaterialTheme {
+                        val isLoading by _isLoading.collectAsState()
+                        val error by _loadingError.collectAsState()
+                        val isFullyInitialized by AppContainer.isInitialized.collectAsState()
 
-            when {
-                showPermissionDialog -> {
-                    PermissionRequiredDialog(
-                        onOpenSettings = {
-                            showPermissionDialog = false
-                            openAppSettings()
-                        },
-                        onDismiss = {
-                            showPermissionDialog = false
-                            finish()
-                        }
-                    )
-                }
-
-                !isInitialized -> {
-                    LoadingScreen(
-                        isLoading = isLoading,
-                        error = errorState,
-                    )
-                }
-
-                else -> {
-                    UI(viewModel)
-                }
-            }
-        }
-        SmsForegroundService.startService(this)
-
-
-    }
-
-    private fun checkAndRequestPermissions(onResult: (Boolean) -> Unit) {
-        permissionHandler.checkAndRequestPermissions { granted ->
-            if (granted) {
-                LoggingManager.logInfo(
-                    component = "MainActivity",
-                    action = "PERMISSIONS_CHECK",
-                    message = "Alle erforderlichen Berechtigungen wurden gewährt"
-                )
-                // Keine direkte Initialisierung hier, nur das Ergebnis zurückmelden
-                onResult(true)
-            } else {
-                LoggingManager.logWarning(
-                    component = "MainActivity",
-                    action = "PERMISSIONS_CHECK",
-                    message = "Nicht alle Berechtigungen wurden gewährt"
-                )
-                onResult(false)
-            }
-        }
-    }
-
-    private fun handlePermissionResult(granted: Boolean) {
-        if (granted && !_isInitialized.value) {
-            lifecycleScope.launch {
-                try {
-                    initializeAfterPermissions()
-                    _isInitialized.value = true  // Update Compose State
-                } catch (e: Exception) {
-                    LoggingManager.logError(
-                        component = "MainActivity",
-                        action = "INIT_ERROR",
-                        message = "Fehler bei der Initialisierung",
-                        error = e
-                    )
-                    setContent {
-                        showErrorAndFinish(
-                            "Initialisierungsfehler",
-                            "Die App konnte nicht korrekt initialisiert werden: ${e.message}"
-                        )
-                    }
-                }
-            }
-        }
-    }
-
-    private fun initializeAfterPermissions() {
-        try {
-            LoggingManager.logInfo(
-                component = "MainActivity",
-                action = "INITIALIZE",
-                message = "Starte App-Initialisierung"
-            )
-
-            // Batterie-Optimierung überspringen - optional nachfragen
-            val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
-            if (!pm.isIgnoringBatteryOptimizations(packageName)) {
-                lifecycleScope.launch {
-                    try {
-                        val intent =
-                            Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
-                                data = Uri.parse("package:$packageName")
+                        when {
+                            !isFullyInitialized || isLoading -> {
+                                LoadingScreen(error = error)
                             }
-                        startActivity(intent)
-                    } catch (e: Exception) {
-                        LoggingManager.logError(
-                            component = "MainActivity",
-                            action = "BATTERY_OPTIMIZATION",
-                            message = "Konnte Batterie-Optimierungseinstellungen nicht öffnen",
-                            error = e
-                        )
+                            else -> {
+                                UI(viewModel)
+                            }
+                        }
                     }
                 }
+
+                // Starte vollständige App-Initialisierung
+                initializeApp()
+
+            } catch (e: Exception) {
+                _loadingError.value = "Initialisierungsfehler: ${e.message}"
+                Log.e("MainActivity", "Error during initialization", e)
             }
-
-//            viewModel = ViewModelProvider(
-//                this,
-//                ContactsViewModelFactory(application, prefsManager, logger)
-//            )[ContactsViewModel::class.java]
-
-            PhoneSmsUtils.initialize()
-            checkSimStatusAndProceed()
-            //viewModel.loadSavedState()
-            viewModel.loadOwnPhoneNumberIfEmpty(this)
-            setupBackHandler()
-            SmsForegroundService.startService(this)
-
-            LoggingManager.logInfo(
-                component = "MainActivity",
-                action = "INITIALIZE",
-                message = "App-Initialisierung abgeschlossen"
-            )
-        } catch (e: Exception) {
-            LoggingManager.logError(
-                component = "MainActivity",
-                action = "INITIALIZE_ERROR",
-                message = "Fehler bei der Initialisierung",
-                error = e
-            )
-            throw e
         }
     }
 
+    private fun initializeApp() {
+        lifecycleScope.launch {
+            try {
+                _loadingError.value = "Initialisiere App..."
+
+                // Warte auf vollständige AppContainer Initialisierung
+                AppContainer.isInitialized.first { it }
+
+                // Prüfe und fordere Berechtigungen an
+                permissionHandler.checkPermissions(
+                    onGranted = {
+                        // Starte Services und weitere Initialisierungen
+                        SmsForegroundService.startService(this@MainActivity)
+
+                        // Füge kleine Verzögerung hinzu um sicherzustellen, dass
+                        // Berechtigungen vollständig gewährt wurden
+                        lifecycleScope.launch {
+                            delay(500) // 500ms Verzögerung
+                            viewModel.initialize() // Dies lädt nun die Kontakte
+                        }
+
+                        // Verstecke LoadingScreen
+                        _isLoading.value = false
+                    },
+                    onDenied = {
+                        _loadingError.value = "Erforderliche Berechtigungen wurden nicht erteilt"
+                        LoggingManager.logWarning(
+                            component = "MainActivity",
+                            action = "PERMISSIONS_DENIED",
+                            message = "Berechtigungen verweigert"
+                        )
+                    }
+                )
+
+            } catch (e: Exception) {
+                _loadingError.value = "Fehler bei der Initialisierung: ${e.message}"
+                LoggingManager.logError(
+                    component = "MainActivity",
+                    action = "INIT_ERROR",
+                    message = "App-Initialisierung fehlgeschlagen",
+                    error = e
+                )
+            }
+        }
+    }
 
     @Composable
-    private fun LoadingScreen(
-        isLoading: Boolean,
-        error: String?
-    ) {
+    private fun LoadingScreen(error: String?) {
         Box(
             modifier = Modifier
                 .fillMaxSize()
@@ -423,7 +245,7 @@ class MainActivity : ComponentActivity() {
                 horizontalAlignment = Alignment.CenterHorizontally,
                 verticalArrangement = Arrangement.spacedBy(16.dp)
             ) {
-                // App Logo und Titel
+                // App Logo
                 Box(
                     modifier = Modifier
                         .size(120.dp)
@@ -446,7 +268,7 @@ class MainActivity : ComponentActivity() {
                     color = MaterialTheme.colorScheme.primary
                 )
 
-                if (isLoading) {
+                if (error == null) {
                     CircularProgressIndicator(
                         modifier = Modifier.padding(vertical = 16.dp)
                     )
@@ -457,21 +279,20 @@ class MainActivity : ComponentActivity() {
                         modifier = Modifier.padding(horizontal = 32.dp)
                     ) {
                         Text(
-                            text = "App wird initialisiert und Berechtigungen geprüft...",
+                            text = "App wird initialisiert...",
                             style = MaterialTheme.typography.titleMedium,
                             textAlign = TextAlign.Center
                         )
 
                         Text(
-                            text = "Für den Start sind die angeforderten Berechtigungen erforderlich:",
-                            style = MaterialTheme.typography.labelMedium, // Kleinere Schrift
-                            textAlign = TextAlign.Center,
+                            text = "Erforderliche Berechtigungen:",
+                            style = MaterialTheme.typography.labelMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
 
                         Column(
-                            modifier = Modifier.padding(top = 4.dp), // Reduzierter Abstand
-                            verticalArrangement = Arrangement.spacedBy(2.dp) // Engerer Abstand
+                            modifier = Modifier.padding(top = 4.dp),
+                            verticalArrangement = Arrangement.spacedBy(2.dp)
                         ) {
                             listOf(
                                 "Kontakte - Für die Auswahl des Weiterleitungsziels",
@@ -488,44 +309,19 @@ class MainActivity : ComponentActivity() {
                                         imageVector = Icons.Default.Info,
                                         contentDescription = null,
                                         tint = MaterialTheme.colorScheme.primary,
-                                        modifier = Modifier.size(12.dp) // Kleineres Icon
+                                        modifier = Modifier.size(12.dp)
                                     )
-                                    Spacer(modifier = Modifier.width(4.dp)) // Geringerer Abstand
+                                    Spacer(modifier = Modifier.width(4.dp))
                                     Text(
                                         text = permission,
-                                        style = MaterialTheme.typography.labelSmall, // Noch kleinere Schrift
+                                        style = MaterialTheme.typography.labelSmall,
                                         color = MaterialTheme.colorScheme.onSurfaceVariant
                                     )
                                 }
                             }
                         }
-
-                        Spacer(modifier = Modifier.height(16.dp))
-
-                        Button(
-                            onClick = { finish() },
-                            colors = ButtonDefaults.buttonColors(
-                                containerColor = MaterialTheme.colorScheme.secondary
-                            ),
-                            modifier = Modifier.padding(top = 8.dp)
-                        ) {
-                            Row(
-                                horizontalArrangement = Arrangement.Center,
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Default.Close,
-                                    contentDescription = null,
-                                    modifier = Modifier.size(18.dp)
-                                )
-                                Spacer(modifier = Modifier.width(8.dp))
-                                Text("App beenden")
-                            }
-                        }
                     }
-                }
-
-                if (error != null) {
+                } else {
                     Column(
                         horizontalAlignment = Alignment.CenterHorizontally,
                         verticalArrangement = Arrangement.spacedBy(8.dp)
@@ -568,90 +364,6 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    @Composable
-    private fun PermissionRequiredDialog(
-        onOpenSettings: () -> Unit,
-        onDismiss: () -> Unit
-    ) {
-        AlertDialog(
-            onDismissRequest = onDismiss,
-            title = {
-                Text("Berechtigungen erforderlich")
-            },
-            text = {
-                Text(
-                    "Diese App benötigt alle angeforderten Berechtigungen für ihre Funktionalität. " +
-                            "Bitte gewähren Sie die Berechtigungen in den Einstellungen."
-                )
-            },
-            confirmButton = {
-                TextButton(onClick = onOpenSettings) {
-                    Text("Einstellungen")
-                }
-            },
-            dismissButton = {
-                TextButton(onClick = onDismiss) {
-                    Text("Beenden")
-                }
-            }
-        )
-    }
-
-    private fun openAppSettings() {
-        val intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
-            data = Uri.fromParts("package", packageName, null)
-        }
-        startActivity(intent)
-        finish()
-    }
-
-    private fun checkSimStatusAndProceed() {
-        val simChecker = SimStatusChecker(this)
-        val simStatus = simChecker.checkSimStatus()
-
-        when {
-            simStatus.errorMessage != null -> {
-                showErrorAndFinish(
-                    "Fehler bei der SIM-Überprüfung",
-                    "Die SIM-Karte konnte nicht überprüft werden: ${simStatus.errorMessage}"
-                )
-            }
-
-            !simStatus.hasCellularSupport -> {
-                showErrorAndFinish(
-                    "Keine Mobilfunk-Unterstützung",
-                    "Dieses Gerät unterstützt keinen Mobilfunk. Die App kann nicht ausgeführt werden."
-                )
-            }
-
-            !simStatus.hasSimCard -> {
-                showErrorAndFinish(
-                    "Keine SIM-Karte",
-                    "Es wurde keine aktive SIM-Karte gefunden. Bitte legen Sie eine SIM-Karte ein und starten Sie die App erneut."
-                )
-            }
-
-            else -> {
-                Log.d("SimCheck", "SIM-Karte ist eingelegt und aktiv")
-                return
-            }
-        }
-    }
-
-    private fun setupBackHandler() {
-        onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
-            override fun handleOnBackPressed() {
-                lifecycleScope.launch {
-                    if (viewModel.forwardingActive.first()) {
-                        viewModel.showExitDialog()
-                    } else {
-                        isEnabled = false
-                        onBackPressedDispatcher.onBackPressed()
-                    }
-                }
-            }
-        })
-    }
 
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
@@ -695,36 +407,6 @@ class MainActivity : ComponentActivity() {
         }
 
         super.onDestroy()
-    }
-
-    private fun showErrorAndFinish(title: String, message: String) {
-        LoggingManager.logError(
-            component = "MainActivity",
-            action = "SHOW_ERROR",
-            message = "Kritischer Fehler: $title - $message",
-            details = mapOf(
-                "errorTitle" to title,
-                "errorMessage" to message
-            )
-        )
-        setContent {
-            AlertDialog(
-                onDismissRequest = { /* Nicht abbrechbar */ },
-                properties = DialogProperties(
-                    dismissOnBackPress = false,
-                    dismissOnClickOutside = false
-                ),
-                title = { Text(title) },
-                text = { Text(message) },
-                confirmButton = {
-                    Button(
-                        onClick = { finish() }  // Beendet die Activity
-                    ) {
-                        Text("App beenden")
-                    }
-                }
-            )
-        }
     }
 
     @Composable
@@ -1018,10 +700,16 @@ class MainActivity : ComponentActivity() {
                 Pair("Deaktivierung fehlgeschlagen", error.message)
 
             is ContactsViewModel.ErrorDialogState.TimeoutError ->
-                Pair("Zeitüberschreitung", "Die Deaktivierung der Weiterleitung dauert zu lange.")
+                Pair(
+                    "Zeitüberschreitung",
+                    "Die Deaktivierung der Weiterleitung dauert zu lange."
+                )
 
             is ContactsViewModel.ErrorDialogState.GeneralError ->
-                Pair("Fehler", "Ein unerwarteter Fehler ist aufgetreten: ${error.error.message}")
+                Pair(
+                    "Fehler",
+                    "Ein unerwarteter Fehler ist aufgetreten: ${error.error.message}"
+                )
         }
 
         AlertDialog(
@@ -1144,10 +832,21 @@ class MainActivity : ComponentActivity() {
     @Composable
     fun HomeScreen(viewModel: ContactsViewModel) {
         val contacts by viewModel.contacts.collectAsState()
-        val isLoading by viewModel.isLoading.collectAsState()
         val selectedContact by viewModel.selectedContact.collectAsState()
         val forwardingActive by viewModel.forwardingActive.collectAsState()
         val filterText by viewModel.filterText.collectAsState()
+
+        // Initialisierung beim ersten Laden
+        LaunchedEffect(Unit) {
+            viewModel.initialize()
+        }
+
+        // Filter neu anwenden beim Betreten des Screens
+        LaunchedEffect(Unit) {
+            if (filterText.isNotEmpty()) {
+                viewModel.applyCurrentFilter()
+            }
+        }
 
         BoxWithConstraints {
             val isLandscape = maxWidth > maxHeight
@@ -1156,7 +855,6 @@ class MainActivity : ComponentActivity() {
                 LandscapeLayout(
                     viewModel = viewModel,
                     contacts = contacts,
-                    isLoading = isLoading,
                     selectedContact = selectedContact,
                     forwardingActive = forwardingActive,
                     filterText = filterText
@@ -1165,7 +863,6 @@ class MainActivity : ComponentActivity() {
                 PortraitLayout(
                     viewModel = viewModel,
                     contacts = contacts,
-                    isLoading = isLoading,
                     selectedContact = selectedContact,
                     forwardingActive = forwardingActive,
                     filterText = filterText
@@ -1178,7 +875,6 @@ class MainActivity : ComponentActivity() {
     fun LandscapeLayout(
         viewModel: ContactsViewModel,
         contacts: List<Contact>,
-        isLoading: Boolean,
         selectedContact: Contact?,
         forwardingActive: Boolean,
         filterText: String
@@ -1190,7 +886,6 @@ class MainActivity : ComponentActivity() {
         ) {
             ContactListBox(
                 contacts = contacts,
-                isLoading = isLoading,
                 selectedContact = selectedContact,
                 onSelectContact = viewModel::toggleContactSelection,
                 modifier = Modifier
@@ -1230,7 +925,6 @@ class MainActivity : ComponentActivity() {
     fun PortraitLayout(
         viewModel: ContactsViewModel,
         contacts: List<Contact>,
-        isLoading: Boolean,
         selectedContact: Contact?,
         forwardingActive: Boolean,
         filterText: String
@@ -1252,7 +946,6 @@ class MainActivity : ComponentActivity() {
 
             ContactListBox(
                 contacts = contacts,
-                isLoading = isLoading,
                 selectedContact = selectedContact,
                 onSelectContact = viewModel::toggleContactSelection,
                 modifier = Modifier.weight(1f)
@@ -1326,7 +1019,8 @@ class MainActivity : ComponentActivity() {
                         checked = forwardingActive,
                         onCheckedChange = { checked ->
                             if (checked) {
-                                SnackbarManager.showInfo("Bitte wählen Sie einen Kontakt aus der Liste aus, um die Weiterleitung zu aktivieren")
+                                SnackbarManager.showInfo(
+                                    "Bitte wählen Sie einen Kontakt aus der Liste aus, um die Weiterleitung zu aktivieren")
                             } else {
                                 onDeactivateForwarding()
                             }
@@ -1425,42 +1119,37 @@ class MainActivity : ComponentActivity() {
     @Composable
     fun ContactListBox(
         contacts: List<Contact>,
-        isLoading: Boolean,
         selectedContact: Contact?,
         onSelectContact: (Contact) -> Unit,
         modifier: Modifier = Modifier
     ) {
         Box(modifier = modifier) {
-            ContactList(
-                contacts = contacts,
-                isLoading = isLoading,
-                selectedContact = selectedContact,
-                onSelectContact = onSelectContact
-            )
-        }
-    }
-
-    @Composable
-    fun ContactList(
-        contacts: List<Contact>,
-        isLoading: Boolean,
-        selectedContact: Contact?,
-        onSelectContact: (Contact) -> Unit
-    ) {
-        if (isLoading) {
-            CircularProgressIndicator(modifier = Modifier.padding(16.dp))
-        } else {
-            LazyColumn(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(vertical = 16.dp)
-            ) {
-                items(contacts) { contact ->
-                    ContactItem(
-                        contact = contact,
-                        isSelected = contact == selectedContact,
-                        onSelect = { onSelectContact(contact) }
+            if (contacts.isEmpty()) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .padding(16.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        text = "Keine Kontakte gefunden",
+                        style = MaterialTheme.typography.bodyLarge,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
+                }
+            } else {
+                LazyColumn(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 16.dp)
+                ) {
+                    items(contacts) { contact ->
+                        ContactItem(
+                            contact = contact,
+                            isSelected = contact == selectedContact,
+                            onSelect = { onSelectContact(contact) }
+                        )
+                    }
                 }
             }
         }
@@ -1588,8 +1277,6 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-
-    // 3. Der neue MailScreen
     @Composable
     fun MailScreen() {
         //val viewModel: ContactsViewModel = viewModel
@@ -1768,23 +1455,22 @@ class MainActivity : ComponentActivity() {
     @Composable
     fun SettingsScreen() {
         val scrollState = rememberScrollState()
-        val focusManager = LocalFocusManager.current
-
+        LocalFocusManager.current
         var isAnyFieldFocused by remember { mutableStateOf(false) }
+        var showPinDialog by remember { mutableStateOf(false) }
+        var showChangePinDialog by remember { mutableStateOf(false) }
+        val sectionTitleStyle = MaterialTheme.typography.titleMedium
 
         Column(
             modifier = Modifier
                 .fillMaxSize()
                 .verticalScroll(scrollState)
         ) {
-            if (isAnyFieldFocused) {
-                KeyboardDismissBar(focusManager)
-            }
 
             PhoneSettingsSection(
                 viewModel = viewModel,
-                onFocusChanged = { isAnyFieldFocused = it }
-            )
+                onFocusChanged = { isAnyFieldFocused = it },
+                sectionTitleStyle = sectionTitleStyle)
 
             HorizontalDivider(
                 modifier = Modifier.padding(horizontal = 16.dp)
@@ -1792,40 +1478,128 @@ class MainActivity : ComponentActivity() {
 
             AppSettingsSection(
                 viewModel = viewModel,
-                onFocusChanged = { isAnyFieldFocused = it }
+                onFocusChanged = { isAnyFieldFocused = it },
+                sectionTitleStyle = sectionTitleStyle
             )
 
             HorizontalDivider(
                 modifier = Modifier.padding(horizontal = 16.dp)
             )
 
-            EmailSettingsSection(viewModel)
+            EmailSettingsSection(
+                viewModel = viewModel,
+                sectionTitleStyle = sectionTitleStyle
+            )
+            HorizontalDivider(modifier = Modifier.padding(horizontal = 16.dp))
+
+            // Neue Log Settings Section
+            LogSettingsSection(
+                sectionTitleStyle = sectionTitleStyle,
+                onDeleteLogs = { showPinDialog = true },
+                onChangePin = { showChangePinDialog = true }
+            )
+
+            // Die existierenden PIN-Dialoge aus dem LogScreen
+            if (showPinDialog) {
+                PinDialog(
+                    onPinCorrect = {
+                        AppContainer.logger.clearLog()
+                        LoggingManager.logInfo(
+                            component = "SettingsScreen",
+                            action = "CLEAR_LOGS",
+                            message = "Log-Einträge wurden gelöscht"
+                        )
+                        SnackbarManager.showSuccess("Logs wurden gelöscht")
+                        showPinDialog = false
+                    },
+                    onDismiss = { showPinDialog = false }
+                )
+            }
+
+            if (showChangePinDialog) {
+                ChangePinDialog(
+                    onDismiss = { showChangePinDialog = false }
+                )
+            }
+
         }
     }
 
     @Composable
-    private fun KeyboardDismissBar(focusManager: FocusManager) {
-        Box(
+    private fun LogSettingsSection(
+        sectionTitleStyle: TextStyle,
+        onDeleteLogs: () -> Unit,
+        onChangePin: () -> Unit
+    ) {
+        Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .height(48.dp)
-                .clickable { focusManager.clearFocus() }
-                .padding(8.dp)
+                .padding(16.dp)
         ) {
+            Text(
+                text = "Log-Einstellungen",
+                style = sectionTitleStyle,
+                modifier = Modifier.padding(bottom = 16.dp)
+            )
+
             Row(
-                modifier = Modifier.fillMaxSize(),
-                horizontalArrangement = Arrangement.Center,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(vertical = 8.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Icon(
-                    imageVector = Icons.Default.Clear,
-                    contentDescription = "Tastatur einklappen",
-                    tint = Color.Gray
-                )
-                Text(
-                    "Tippen zum Einklappen der Tastatur",
-                    color = Color.Gray
-                )
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = "Log-Datei löschen",
+                        style = MaterialTheme.typography.bodyLarge
+                    )
+                    Text(
+                        text = "Löscht alle Protokolleinträge",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                IconButton(onClick = onDeleteLogs) {
+                    Icon(
+                        imageVector = Icons.Default.Delete,
+                        contentDescription = "Logs löschen",
+                        tint = MaterialTheme.colorScheme.error
+                    )
+                }
+            }
+
+            HorizontalDivider(
+                modifier = Modifier
+                    .padding(vertical = 8.dp)
+                    .alpha(0.5f)
+            )
+
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(vertical = 8.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = "PIN ändern",
+                        style = MaterialTheme.typography.bodyLarge
+                    )
+                    Text(
+                        text = "PIN für Löschfunktion ändern",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                IconButton(onClick = onChangePin) {
+                    Icon(
+                        imageVector = Icons.Default.Lock,
+                        contentDescription = "PIN ändern",
+                        tint = MaterialTheme.colorScheme.primary
+                    )
+                }
             }
         }
     }
@@ -1833,7 +1607,8 @@ class MainActivity : ComponentActivity() {
     @Composable
     private fun PhoneSettingsSection(
         viewModel: ContactsViewModel,
-        onFocusChanged: (Boolean) -> Unit
+        onFocusChanged: (Boolean) -> Unit,
+        sectionTitleStyle: TextStyle
     ) {
         val context = LocalContext.current
         val ownPhoneNumber by viewModel.ownPhoneNumber.collectAsState()
@@ -1854,11 +1629,10 @@ class MainActivity : ComponentActivity() {
         ) {
             Text(
                 text = "Telefon-Einstellungen",
-                style = MaterialTheme.typography.titleMedium,
+                style = sectionTitleStyle,
                 modifier = Modifier.padding(bottom = 16.dp)
             )
 
-            // Own Phone Number
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically
@@ -1886,7 +1660,6 @@ class MainActivity : ComponentActivity() {
 
             Spacer(modifier = Modifier.height(16.dp))
 
-            // Forwarding Status
             Surface(
                 modifier = Modifier.fillMaxWidth(),
                 shape = MaterialTheme.shapes.small,
@@ -1904,20 +1677,15 @@ class MainActivity : ComponentActivity() {
                         enabled = false
                     )
                     Spacer(modifier = Modifier.width(8.dp))
-                    Text(
-                        "Weiterleitung aktiv",
-                        style = MaterialTheme.typography.bodyMedium
-                    )
+                    Text("Weiterleitung aktiv")
                 }
             }
 
             Spacer(modifier = Modifier.height(16.dp))
 
-            // Country Code Information
             Column {
                 Text(
                     text = "Erkannte Ländervorwahl",
-                    style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
                 Spacer(modifier = Modifier.height(4.dp))
@@ -1931,15 +1699,10 @@ class MainActivity : ComponentActivity() {
                             .fillMaxWidth()
                             .padding(16.dp)
                     ) {
-                        Text(
-                            text = PhoneSmsUtils.getCountryNameForCode(countryCode),
-                            style = MaterialTheme.typography.bodyLarge,
-                            color = MaterialTheme.colorScheme.onSurface
-                        )
+                        Text(text = PhoneSmsUtils.getCountryNameForCode(countryCode))
                         Spacer(modifier = Modifier.height(4.dp))
                         Text(
                             text = "Quelle: $countryCodeSource",
-                            style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
                     }
@@ -1951,16 +1714,17 @@ class MainActivity : ComponentActivity() {
     @Composable
     private fun AppSettingsSection(
         viewModel: ContactsViewModel,
-        onFocusChanged: (Boolean) -> Unit
+        onFocusChanged: (Boolean) -> Unit,
+        sectionTitleStyle: TextStyle
     ) {
         val filterText by viewModel.filterText.collectAsState()
         val testSmsText by viewModel.testSmsText.collectAsState()
-        val testEmailText by viewModel.testEmailText.collectAsState() // Neue State
+        val testEmailText by viewModel.testEmailText.collectAsState()
         val topBarTitle by viewModel.topBarTitle.collectAsState()
 
         var isFilterTextFocused by remember { mutableStateOf(false) }
         var isTestSmsTextFocused by remember { mutableStateOf(false) }
-        var isTestEmailTextFocused by remember { mutableStateOf(false) } // Neue State
+        var isTestEmailTextFocused by remember { mutableStateOf(false) }
         var isTopBarTitleFocused by remember { mutableStateOf(false) }
 
         LaunchedEffect(
@@ -1969,7 +1733,10 @@ class MainActivity : ComponentActivity() {
             isTestEmailTextFocused,
             isTopBarTitleFocused
         ) {
-            onFocusChanged(isFilterTextFocused || isTestSmsTextFocused || isTestEmailTextFocused || isTopBarTitleFocused)
+            onFocusChanged(
+                isFilterTextFocused || isTestSmsTextFocused ||
+                        isTestEmailTextFocused || isTopBarTitleFocused
+            )
         }
 
         Column(
@@ -1979,7 +1746,7 @@ class MainActivity : ComponentActivity() {
         ) {
             Text(
                 text = "App-Einstellungen",
-                style = MaterialTheme.typography.titleMedium,
+                style = sectionTitleStyle,
                 modifier = Modifier.padding(bottom = 16.dp)
             )
 
@@ -1997,7 +1764,7 @@ class MainActivity : ComponentActivity() {
             OutlinedTextField(
                 value = testSmsText,
                 onValueChange = { viewModel.updateTestSmsText(it) },
-                label = { Text("Text des Test-SMS") },
+                label = { Text("Text der Test-SMS") },
                 modifier = Modifier
                     .fillMaxWidth()
                     .onFocusChanged { isTestSmsTextFocused = it.isFocused }
@@ -2011,13 +1778,7 @@ class MainActivity : ComponentActivity() {
                 label = { Text("Text der Test-Email") },
                 modifier = Modifier
                     .fillMaxWidth()
-                    .onFocusChanged { isTestEmailTextFocused = it.isFocused },
-                textStyle = MaterialTheme.typography.bodyMedium,
-                colors = OutlinedTextFieldDefaults.colors(
-                    focusedBorderColor = MaterialTheme.colorScheme.primary,
-                    unfocusedBorderColor = MaterialTheme.colorScheme.outline
-                ),
-                supportingText = { Text("Wird für Test-Emails verwendet") }
+                    .onFocusChanged { isTestEmailTextFocused = it.isFocused }
             )
 
             Spacer(modifier = Modifier.height(16.dp))
@@ -2034,11 +1795,14 @@ class MainActivity : ComponentActivity() {
     }
 
     @Composable
-    fun EmailSettingsSection(viewModel: ContactsViewModel) {
-        var smtpHost by remember { mutableStateOf(viewModel.smtpHost.value) }
-        var smtpPort by remember { mutableStateOf(viewModel.smtpPort.value.toString()) }
-        var smtpUsername by remember { mutableStateOf(viewModel.smtpUsername.value) }
-        var smtpPassword by remember { mutableStateOf(viewModel.smtpPassword.value) }
+    private fun EmailSettingsSection(
+        viewModel: ContactsViewModel,
+        sectionTitleStyle: TextStyle
+    ) {
+        val smtpHost by viewModel.smtpHost.collectAsState()
+        val smtpPort by viewModel.smtpPort.collectAsState()
+        val smtpUsername by viewModel.smtpUsername.collectAsState()
+        val smtpPassword by viewModel.smtpPassword.collectAsState()
         var isPasswordVisible by remember { mutableStateOf(false) }
 
         Column(
@@ -2048,13 +1812,13 @@ class MainActivity : ComponentActivity() {
         ) {
             Text(
                 text = "E-Mail-Einstellungen",
-                style = MaterialTheme.typography.titleMedium,
+                style = sectionTitleStyle,
                 modifier = Modifier.padding(bottom = 16.dp)
             )
 
             OutlinedTextField(
                 value = smtpHost,
-                onValueChange = { smtpHost = it },
+                onValueChange = { viewModel.updateSmtpSettings(it, smtpPort, smtpUsername, smtpPassword) },
                 label = { Text("SMTP Server") },
                 modifier = Modifier.fillMaxWidth()
             )
@@ -2062,11 +1826,10 @@ class MainActivity : ComponentActivity() {
             Spacer(modifier = Modifier.height(8.dp))
 
             OutlinedTextField(
-                value = smtpPort,
+                value = smtpPort.toString(),
                 onValueChange = {
-                    if (it.all { char -> char.isDigit() }) {
-                        smtpPort = it
-                    }
+                    val newPort = it.toIntOrNull() ?: smtpPort
+                    viewModel.updateSmtpSettings(smtpHost, newPort, smtpUsername, smtpPassword)
                 },
                 label = { Text("TLS Port") },
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
@@ -2077,40 +1840,40 @@ class MainActivity : ComponentActivity() {
 
             OutlinedTextField(
                 value = smtpUsername,
-                onValueChange = { smtpUsername = it },
-                label = { Text("Benutzername") },
+                onValueChange = { viewModel.updateSmtpSettings(smtpHost, smtpPort, it, smtpPassword) },
+                label = { Text("Benutzername/Email-Adresse") },
                 modifier = Modifier.fillMaxWidth()
             )
 
             Spacer(modifier = Modifier.height(8.dp))
 
-            OutlinedTextField(
-                value = smtpPassword,
-                onValueChange = { smtpPassword = it },
-                label = { Text("Passwort") },
-                visualTransformation = if (isPasswordVisible)
-                    VisualTransformation.None
-                else
-                    PasswordVisualTransformation(),
-                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
-                trailingIcon = {
-                    IconButton(
-                        onClick = { isPasswordVisible = !isPasswordVisible }
-                    ) {
-                        Icon(
-                            imageVector = if (isPasswordVisible)
-                                Icons.Default.Visibility
-                            else
-                                Icons.Default.VisibilityOff,
-                            contentDescription = if (isPasswordVisible)
-                                "Passwort verbergen"
-                            else
-                                "Passwort anzeigen"
-                        )
-                    }
-                },
-                modifier = Modifier.fillMaxWidth()
-            )
+            if (!smtpHost.equals("smtp.world4you.com", ignoreCase = true)) {
+                OutlinedTextField(
+                    value = smtpPassword,
+                    onValueChange = { viewModel.updateSmtpSettings(smtpHost, smtpPort, smtpUsername, it) },
+                    label = { Text("Passwort") },
+                    visualTransformation = if (isPasswordVisible)
+                        VisualTransformation.None
+                    else
+                        PasswordVisualTransformation(),
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                    trailingIcon = {
+                        IconButton(onClick = { isPasswordVisible = !isPasswordVisible }) {
+                            Icon(
+                                imageVector = if (isPasswordVisible)
+                                    Icons.Default.Visibility
+                                else
+                                    Icons.Default.VisibilityOff,
+                                contentDescription = if (isPasswordVisible)
+                                    "Passwort verbergen"
+                                else
+                                    "Passwort anzeigen"
+                            )
+                        }
+                    },
+                    modifier = Modifier.fillMaxWidth()
+                )
+            }
 
             Spacer(modifier = Modifier.height(16.dp))
 
@@ -2121,32 +1884,28 @@ class MainActivity : ComponentActivity() {
                 Button(
                     onClick = {
                         viewModel.updateSmtpSettings(
-                            smtpHost,
-                            smtpPort.toIntOrNull() ?: 587,
-                            smtpUsername,
-                            smtpPassword
+                            "smtp.gmail.com",
+                            587,
+                            "",
+                            ""
                         )
-                        SnackbarManager.showSuccess("E-Mail-Einstellungen gespeichert")
-                    }
-                ) {
-                    Text("Speichern")
-                }
-
-                Button(
-                    onClick = {
-                        // Gmail-Standardwerte setzen
-                        smtpHost = "smtp.gmail.com"
-                        smtpPort = "587"
-                        //smtpUsername = "guenther.meusburger.yt@gmail.com"
-                        //smtpPassword = "hicz jipi vxyv dzml"
-                        smtpUsername = ""
-                        smtpPassword = ""
                         SnackbarManager.showSuccess("Benutzername und App-spezifisches Passwort eingeben.")
-
                     }
-
                 ) {
                     Text("Gmail")
+                }
+                Button(
+                    onClick = {
+                        viewModel.updateSmtpSettings(
+                            "mail.gmx.net",
+                            587,
+                            "",
+                            ""
+                        )
+                        SnackbarManager.showSuccess("Email-Adresse und Passwort eingeben.")
+                    }
+                ) {
+                    Text("GMX")
                 }
 
                 Button(
@@ -2164,9 +1923,8 @@ class MainActivity : ComponentActivity() {
                 }
             }
 
-            // Info-Text
             Text(
-                text = "Hinweis: Für Gmail wird ein App-spezifisches Passwort benötigt.",
+                text = "Hinweis: Für Gmail wird ein App-spezifisches Passwort benötigt und für GMX muss IMAP oder POP3 in den Einstellungen aktiviert werden.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(top = 8.dp)
@@ -2176,10 +1934,9 @@ class MainActivity : ComponentActivity() {
 
 
     private fun getPhoneNumber(context: Context, callback: (String) -> Unit) {
-        // Überprüfen Sie zuerst die Berechtigung
-        permissionHandler.checkAndRequestPermissions { granted ->
-            if (granted) {
-                // Wenn die Berechtigung erteilt wurde, versuchen Sie, die Nummer abzurufen
+        AppContainer.permissionHandler.checkPermissions(
+            onGranted = {
+                // Wenn die Berechtigung erteilt wurde, versuchen Sie die Nummer abzurufen
                 val number = PhoneSmsUtils.getSimCardNumber(context)
                 LoggingManager.logInfo(
                     component = "MainActivity",
@@ -2192,7 +1949,8 @@ class MainActivity : ComponentActivity() {
                     )
                 )
                 callback(number)
-            } else {
+            },
+            onDenied = {
                 LoggingManager.logWarning(
                     component = "MainActivity",
                     action = "PHONE_NUMBER_RETRIEVAL",
@@ -2208,7 +1966,7 @@ class MainActivity : ComponentActivity() {
                 )
                 callback("")
             }
-        }
+        )
     }
 
     @Composable
@@ -2228,7 +1986,7 @@ class MainActivity : ComponentActivity() {
                 Row(
                     modifier = Modifier
                         .fillMaxSize()
-                        .padding(16.dp)
+
                 ) {
                     Box(
                         modifier = Modifier
@@ -2238,7 +1996,7 @@ class MainActivity : ComponentActivity() {
                         LogTable(logEntriesHtml)
                     }
 
-                    Spacer(modifier = Modifier.width(16.dp))
+                    Spacer(modifier = Modifier.width(8.dp))
 
                     // Icon-Spalte ohne weight, nur mit der benötigten Breite
                     Column(
@@ -2253,7 +2011,7 @@ class MainActivity : ComponentActivity() {
                             verticalArrangement = Arrangement.spacedBy(16.dp)
                         ) {
                             ShareLogIconButton(context, logEntries)
-                            DeleteLogIconButton()
+                            //DeleteLogIconButton()
                             RefreshLogButton(viewModel)
                         }
                     }
@@ -2262,13 +2020,13 @@ class MainActivity : ComponentActivity() {
                 Column(
                     modifier = Modifier
                         .fillMaxSize()
-                        .padding(16.dp)
+
                 ) {
                     Box(modifier = Modifier.weight(1f)) {
                         LogTable(logEntriesHtml)
                     }
 
-                    Spacer(modifier = Modifier.height(16.dp))
+                    Spacer(modifier = Modifier.height(8.dp))
 
                     Row(
                         modifier = Modifier.fillMaxWidth(),
@@ -2276,8 +2034,6 @@ class MainActivity : ComponentActivity() {
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         ShareLogIconButton(context, logEntries)
-                        Spacer(modifier = Modifier.width(16.dp))
-                        DeleteLogIconButton()
                         Spacer(modifier = Modifier.width(16.dp))
                         RefreshLogButton(viewModel)
                     }
@@ -2308,77 +2064,112 @@ class MainActivity : ComponentActivity() {
                                     details = mapOf(
                                         "errorCode" to (error?.errorCode ?: -1),
                                         "url" to (request?.url?.toString() ?: "unknown"),
-                                        "description" to (error?.description?.toString()
-                                            ?: "unknown")
+                                        "description" to (error?.description?.toString() ?: "unknown")
                                     )
                                 )
                             }
                         }
                         settings.apply {
                             javaScriptEnabled = false
-                            loadWithOverviewMode = true
-                            useWideViewPort = true
+                            loadWithOverviewMode = false  // Geändert zu false
+                            useWideViewPort = false      // Geändert zu false
                             builtInZoomControls = true
                             displayZoomControls = false
                             setSupportZoom(true)
                         }
 
-                        // Inject CSS for improved table styling
                         val css = """
-                        <style>
+                    <style>
+                        html, body {
+                            margin: 0;
+                            padding: 0;
+                            width: 100%;
+                            overflow-x: hidden;
+                            font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+                            font-size: 11px;
+                            line-height: 1.2;
+                        }
+                        table {
+                            width: 100%;
+                            border-collapse: collapse;
+                            table-layout: fixed;
+                        }
+                        th {
+                            background-color: #f0f0f0;
+                            position: sticky;
+                            top: 0;
+                            z-index: 1;
+                            padding: 2px 4px;
+                            text-align: left;
+                            border: none;
+                            font-size: 10px;
+                            overflow: hidden;
+                            text-overflow: ellipsis;
+                        }
+                        td {
+                            padding: 1px 4px;
+                            border: none;
+                            border-bottom: 1px solid #eee;
+                            vertical-align: top;
+                            font-size: 10px;
+                            max-width: 0;
+                            overflow: hidden;
+                            text-overflow: ellipsis;
+                            word-wrap: break-word;
+                        }
+                        .time-column {
+                            width: 90px;
+                            min-width: 90px;
+                            max-width: 90px;
+                        }
+                        .time-cell {
+                            white-space: nowrap;
+                            overflow: hidden;
+                            text-overflow: ellipsis;
+                        }
+                        .date {
+                            font-weight: normal;
+                            font-size: 9px;
+                        }
+                        .time {
+                            color: #666;
+                            font-size: 9px;
+                        }
+                        .entry-column {
+                            word-break: break-all;
+                            white-space: normal;
+                            width: auto;
+                            overflow-wrap: break-word;
+                        }
+                        .sms-forward {
+                            color: #d32f2f;
+                            font-weight: 500;
+                        }
+                        tr:hover {
+                            background: #f8f8f8;
+                        }
+                        @media (prefers-color-scheme: dark) {
                             body {
-                                margin: 0;
-                                padding: 8px;
-                                font-family: sans-serif;
+                                background-color: #121212;
+                                color: #ffffff;
                             }
-                            .log-table {
-                                width: 100%;
-                                border-collapse: collapse;
-                                table-layout: fixed;
+                            th {
+                                background-color: #1e1e1e;
+                                color: #ffffff;
                             }
-                            .log-table th {
-                                background-color: #f0f0f0;
-                                position: sticky;
-                                top: 0;
-                                z-index: 1;
-                                padding: 8px;
-                                text-align: left;
-                                border: 1px solid #ddd;
+                            td {
+                                border-bottom-color: #333;
                             }
-                            .log-table td {
-                                padding: 8px;
-                                border: 1px solid #ddd;
-                                vertical-align: top;
+                            tr:hover {
+                                background: #1a1a1a;
                             }
-                            .log-table .time-col {
-                                width: 75px;
-                                white-space: nowrap;
+                            .time {
+                                color: #999;
                             }
-                            .log-table .type-col {
-                                width: 60px;
-                                white-space: nowrap;
-                            }
-                            .log-table .entry-col {
-                                word-wrap: break-word;
-                                white-space: pre-wrap;
-                            }
-                            @media (prefers-color-scheme: dark) {
-                                body {
-                                    background-color: #121212;
-                                    color: #ffffff;
-                                }
-                                .log-table th {
-                                    background-color: #1e1e1e;
-                                    border-color: #333;
-                                }
-                                .log-table td {
-                                    border-color: #333;
-                                }
-                            }
-                        </style>
-                    """.trimIndent()
+                        }
+                    </style>
+                    """
 
-                        // Modify the log entries HTML to include the new CSS and table classes
                         val modifiedHtml = logEntriesHtml.replace(
                             "<table",
                             "$css<table class=\"log-table\""
@@ -2424,17 +2215,7 @@ class MainActivity : ComponentActivity() {
         IconButton(
             onClick = {
                 if (logEntries.isNotEmpty()) {
-                    val shareIntent = Intent().apply {
-                        action = Intent.ACTION_SEND
-                        putExtra(Intent.EXTRA_TEXT, logEntries)
-                        type = "text/plain"
-                    }
-                    context.startActivity(
-                        Intent.createChooser(
-                            shareIntent,
-                            "Log-Einträge teilen"
-                        )
-                    )
+                    shareLogsAsFile(context)
                 } else {
                     SnackbarManager.showWarning(
                         "Keine Log-Einträge zum Teilen vorhanden",
@@ -2450,32 +2231,208 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    @Composable
-    fun DeleteLogIconButton() {
-        val scope = rememberCoroutineScope()  // Hole CoroutineScope für Composables
+    private fun shareLogsAsFile(context: Context) {
+        try {
+            // Erstelle temporäre Datei
+            val timeStamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.getDefault()).format(Date())
+            val fileName = "sms_forwarder_log_$timeStamp.csv"
+            val file = File(context.cacheDir, fileName)
 
-        IconButton(
-            onClick = {
-                scope.launch {  // Starte Coroutine für suspend function
-                    logger.clearLog()
-                    LoggingManager.logInfo(
-                        component = "LogScreen",
-                        action = "CLEAR_LOGS",
-                        message = "Log-Einträge wurden gelöscht",
-                        details = mapOf(
-                            "timestamp" to System.currentTimeMillis(),
-                            "userInitiated" to true
-                        )
+            // Hole CSV-Daten vom Logger und schreibe sie in die Datei
+            val csvContent = AppContainer.logger.getLogEntriesAsCsv()
+            file.writeText(csvContent)
+
+            // Erstelle FileProvider URI
+            val fileUri = FileProvider.getUriForFile(
+                context,
+                "${context.packageName}.provider",
+                file
+            )
+
+            // Erstelle und starte Share Intent
+            val intent = Intent(Intent.ACTION_SEND).apply {
+                type = "text/csv"
+                putExtra(Intent.EXTRA_STREAM, fileUri)
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+
+            context.startActivity(Intent.createChooser(intent, "Log-Datei teilen"))
+
+            LoggingManager.logInfo(
+                component = "MainActivity",
+                action = "SHARE_LOGS",
+                message = "CSV-Log-Datei wurde zum Teilen erstellt",
+                details = mapOf(
+                    "filename" to fileName,
+                    "size" to file.length()
+                )
+            )
+
+        } catch (e: Exception) {
+            LoggingManager.logError(
+                component = "MainActivity",
+                action = "SHARE_LOGS_ERROR",
+                message = "Fehler beim Erstellen der CSV-Datei",
+                error = e
+            )
+            SnackbarManager.showError("Fehler beim Teilen der Logs")
+        }
+    }
+
+    @Composable
+    fun PinDialog(
+        onPinCorrect: () -> Unit,
+        onDismiss: () -> Unit
+    ) {
+        var pin by remember { mutableStateOf("") }
+        var error by remember { mutableStateOf(false) }
+
+        AlertDialog(
+            onDismissRequest = onDismiss,
+            title = { Text("PIN eingeben") },
+            text = {
+                Column {
+                    OutlinedTextField(
+                        value = pin,
+                        onValueChange = {
+                            if (it.length <= 4 && it.all { c -> c.isDigit() }) {
+                                pin = it
+                                error = false
+                            }
+                        },
+                        label = { Text("PIN") },
+                        keyboardOptions = KeyboardOptions(
+                            keyboardType = KeyboardType.NumberPassword,
+                            imeAction = ImeAction.Done
+                        ),
+                        visualTransformation = PasswordVisualTransformation(),
+                        isError = error,
+                        supportingText = if (error) {
+                            { Text("Falsche PIN") }
+                        } else null,
+                        modifier = Modifier.fillMaxWidth()
                     )
                 }
-                SnackbarManager.showSuccess("Logs wurden gelöscht")
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    if (pin == prefsManager.getLogPIN()) {
+                        onPinCorrect()
+                    } else {
+                        error = true
+                    }
+                }) {
+                    Text("OK")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = onDismiss) {
+                    Text("Abbrechen")
+                }
             }
-        ) {
-            Icon(
-                imageVector = Icons.Filled.Delete,
-                contentDescription = "Log löschen"
-            )
-        }
+        )
+    }
+
+    @Composable
+    fun ChangePinDialog(
+        onDismiss: () -> Unit
+    ) {
+        var currentPin by remember { mutableStateOf("") }
+        var newPin by remember { mutableStateOf("") }
+        var confirmPin by remember { mutableStateOf("") }
+        var error by remember { mutableStateOf<String?>(null) }
+
+        AlertDialog(
+            onDismissRequest = onDismiss,
+            title = { Text("PIN ändern") },
+            text = {
+                Column(
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    OutlinedTextField(
+                        value = currentPin,
+                        onValueChange = {
+                            if (it.length <= 4 && it.all { c -> c.isDigit() }) {
+                                currentPin = it
+                                error = null
+                            }
+                        },
+                        label = { Text("Aktuelle PIN") },
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
+                        visualTransformation = PasswordVisualTransformation(),
+                        modifier = Modifier.fillMaxWidth()
+                    )
+
+                    OutlinedTextField(
+                        value = newPin,
+                        onValueChange = {
+                            if (it.length <= 4 && it.all { c -> c.isDigit() }) {
+                                newPin = it
+                                error = null
+                            }
+                        },
+                        label = { Text("Neue PIN") },
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
+                        visualTransformation = PasswordVisualTransformation(),
+                        modifier = Modifier.fillMaxWidth()
+                    )
+
+                    OutlinedTextField(
+                        value = confirmPin,
+                        onValueChange = {
+                            if (it.length <= 4 && it.all { c -> c.isDigit() }) {
+                                confirmPin = it
+                                error = null
+                            }
+                        },
+                        label = { Text("Neue PIN bestätigen") },
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
+                        visualTransformation = PasswordVisualTransformation(),
+                        modifier = Modifier.fillMaxWidth()
+                    )
+
+                    if (error != null) {
+                        Text(
+                            text = error!!,
+                            color = MaterialTheme.colorScheme.error,
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    when {
+                        currentPin != prefsManager.getLogPIN() -> {
+                            error = "Aktuelle PIN ist falsch"
+                        }
+                        newPin.length != 4 -> {
+                            error = "Neue PIN muss 4 Stellen haben"
+                        }
+                        newPin != confirmPin -> {
+                            error = "PINs stimmen nicht überein"
+                        }
+                        else -> {
+                            prefsManager.setLogPIN(newPin)
+                            LoggingManager.logInfo(
+                                component = "MainActivity",
+                                action = "CHANGE_PIN",
+                                message = "Log-PIN wurde geändert"
+                            )
+                            SnackbarManager.showSuccess("PIN wurde geändert")
+                            onDismiss()
+                        }
+                    }
+                }) {
+                    Text("Speichern")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = onDismiss) {
+                    Text("Abbrechen")
+                }
+            }
+        )
     }
 
     @Composable
@@ -2492,8 +2449,7 @@ class MainActivity : ComponentActivity() {
                 .verticalScroll(scrollState)
                 .padding(16.dp)
         ) {
-
-            // Logo
+            // Logo-Sektion
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -2516,7 +2472,6 @@ class MainActivity : ComponentActivity() {
                     )
                 }
 
-                Spacer(modifier = Modifier.width(16.dp))
                 Spacer(modifier = Modifier.width(16.dp))
                 Column {
                     Text(
@@ -2544,12 +2499,11 @@ class MainActivity : ComponentActivity() {
                         modifier = Modifier.fillMaxWidth()
                     )
                 }
-
             }
 
             Spacer(modifier = Modifier.height(16.dp))
 
-            // HTML-Inhalt
+            // HTML-Content mit neuem Inhalt
             AndroidView(
                 factory = { ctx ->
                     WebView(ctx).apply {
@@ -2559,11 +2513,7 @@ class MainActivity : ComponentActivity() {
                             displayZoomControls = false
                         }
                         webViewClient = WebViewClient()
-
-                        // Setze die Hintergrundfarbe basierend auf dem Thema
                         setBackgroundColor(if (isDarkTheme) 0xFF121212.toInt() else 0xFFFFFFFF.toInt())
-
-                        // Lade den HTML-Inhalt
                         loadDataWithBaseURL(
                             null,
                             getHtmlContent(isDarkTheme, context),
@@ -2574,7 +2524,6 @@ class MainActivity : ComponentActivity() {
                     }
                 },
                 update = { webView ->
-                    // Aktualisiere die WebView, wenn sich das Theme ändert
                     webView.loadDataWithBaseURL(
                         null,
                         getHtmlContent(isDarkTheme, context),
@@ -2592,7 +2541,6 @@ class MainActivity : ComponentActivity() {
         val backgroundColor = if (isDarkTheme) "#121212" else "#FFFFFF"
         val textColor = if (isDarkTheme) "#E0E0E0" else "#333333"
 
-        // Ermittle Android-Versionsdetails
         val currentAndroidVersion = Build.VERSION.RELEASE
         val currentSDKVersion = Build.VERSION.SDK_INT
         val minSDKVersion = context.applicationInfo.minSdkVersion
@@ -2648,23 +2596,18 @@ class MainActivity : ComponentActivity() {
                 background-color: ${if (isDarkTheme) "#333333" else "#E0E0E0"};
                 color: ${if (isDarkTheme) "#E0E0E0" else "#333333"};
             }
-            .subsection {
-                margin-top: 16px;
-                padding-top: 12px;
-                border-top: 1px solid ${if (isDarkTheme) "#333333" else "#E0E0E0"};
-            }
             .feature-list {
                 list-style-type: none;
                 padding: 0;
                 margin: 0;
             }
             .feature-item {
-                margin-bottom: 16px;
+                margin-bottom: 24px;
             }
             .feature-title {
                 font-weight: 600;
                 color: ${if (isDarkTheme) "#E0E0E0" else "#333333"};
-                margin-bottom: 4px;
+                margin-bottom: 8px;
             }
             .feature-description {
                 color: ${if (isDarkTheme) "#B0B0B0" else "#666666"};
@@ -2684,36 +2627,40 @@ class MainActivity : ComponentActivity() {
                 <li class="feature-item">
                     <div class="feature-title">Kontaktauswahl und Management</div>
                     <div class="feature-description">
-                        Wählen Sie einfach einen Kontakt aus Ihrer Kontaktliste aus, an den SMS und Anrufe weitergeleitet werden sollen.
-                        Die App speichert Ihre Auswahl und ermöglicht es Ihnen, den Weiterleitungskontakt jederzeit zu ändern.
-                        Die verbesserte Kontaktsuche unterstützt nun auch die Suche nach Telefonnummern und Teilbegriffen.
-                    </div>
-                </li>
-                
-                <li class="feature-item">
-                    <div class="feature-title">Duale SMS-Weiterleitung</div>
-                    <div class="feature-description">
-                        <strong>NEU: Unabhängige Weiterleitungswege</strong><br>
-                        Die App unterstützt nun zwei voneinander unabhängige Weiterleitungsmethoden:
+                        Die App ermöglicht die intuitive Auswahl eines Kontakts für die Weiterleitung von SMS und Anrufen. 
+                        Nutzen Sie die verbesserte Suchfunktion, die sowohl nach Namen als auch nach Telefonnummern sucht. 
+                        Die Kontaktliste unterstützt:
                         <ul>
-                            <li>Klassische SMS-zu-SMS Weiterleitung an eine ausgewählte Telefonnummer</li>
-                            <li>Parallele SMS-zu-Email Weiterleitung an beliebig viele Email-Adressen</li>
+                            <li>Direkte Suche nach Namen oder Nummern</li>
+                            <li>Automatische Erkennung von Mobilfunkanbietern</li>
+                            <li>Persistente Speicherung der Auswahl</li>
+                            <li>Schnelle Kontaktwechsel</li>
                         </ul>
-                        Beide Funktionen können gleichzeitig oder einzeln genutzt werden.
                     </div>
                 </li>
                 
                 <li class="feature-item">
-                    <div class="feature-title">Email-Weiterleitung (NEU)</div>
+                    <div class="feature-title">Weiterleitung von SMS</div>
                     <div class="feature-description">
-                        <strong>Umfangreiche Email-Funktionalität:</strong>
+                        Die SMS-Weiterleitung bietet zwei unabhängige Weiterleitungswege, die Sie einzeln oder kombiniert nutzen können:
                         <ul>
-                            <li>Weiterleitung von SMS an mehrere Email-Adressen gleichzeitig</li>
-                            <li>Formatierte Emails mit Absender, Zeitstempel und vollständigem SMS-Text</li>
-                            <li>Flexibles SMTP-Setup mit vordefinierten Einstellungen für gängige Provider</li>
-                            <li>Unterstützung für Gmail mit App-Passwörtern</li>
-                            <li>Test-Email-Funktion zur Überprüfung der Konfiguration</li>
-                            <li>Verschlüsselte Speicherung der Email-Zugangsdaten</li>
+                            <li>SMS-zu-SMS: Direkte Weiterleitung an eine ausgewählte Telefonnummer</li>
+                            <li>SMS-zu-Email: Weiterleitung an beliebig viele Email-Adressen</li>
+                            <li>Formatierte Weiterleitungen mit Absender und Zeitstempel</li>
+                            <li>Test-Funktionen für beide Weiterleitungswege</li>
+                        </ul>
+                    </div>
+                </li>
+                
+                <li class="feature-item">
+                    <div class="feature-title">Email-Konfiguration</div>
+                    <div class="feature-description">
+                        Die Email-Weiterleitung bietet umfangreiche Konfigurationsmöglichkeiten:
+                        <ul>
+                            <li>Unterstützung für verschiedene Email-Provider (Gmail, eigene SMTP-Server)</li>
+                            <li>Verschlüsselte Speicherung der Zugangsdaten</li>
+                            <li>Individuelle Test-Emails an jede konfigurierte Adresse</li>
+                            <li>Detaillierte Fehlerdiagnose bei Zustellungsproblemen</li>
                         </ul>
                     </div>
                 </li>
@@ -2721,65 +2668,51 @@ class MainActivity : ComponentActivity() {
                 <li class="feature-item">
                     <div class="feature-title">Anrufweiterleitung</div>
                     <div class="feature-description">
-                        Eingehende Anrufe werden automatisch an Ihre gewählte Nummer umgeleitet.
-                        Die App nutzt dafür die native Weiterleitungsfunktion Ihres Telefons, was maximale Kompatibilität
-                        und Zuverlässigkeit gewährleistet. Die Weiterleitung kann jederzeit aktiviert oder deaktiviert werden.
-                    </div>
-                </li>
-                
-                <li class="feature-item">
-                    <div class="feature-title">Erweiterte Test-Funktionen</div>
-                    <div class="feature-description">
-                        <strong>NEU: Umfassende Testmöglichkeiten</strong>
+                        Die Anrufweiterleitung nutzt die native Telefonfunktion Ihres Geräts:
                         <ul>
-                            <li>Test-SMS an weiterleitende Telefonnummer</li>
-                            <li>Test-Emails an jede konfigurierte Email-Adresse</li>
-                            <li>Anpassbare Test-Nachrichteninhalte</li>
-                            <li>Sofortige Erfolgsmeldungen und Fehlerdiagnose</li>
+                            <li>Automatische Weiterleitung aller eingehenden Anrufe</li>
+                            <li>Verwendung von USSD-Codes für maximale Kompatibilität</li>
+                            <li>Gleichzeitige Aktivierung mit SMS-Weiterleitung</li>
+                            <li>Status-Anzeige der aktiven Weiterleitung</li>
                         </ul>
                     </div>
                 </li>
                 
                 <li class="feature-item">
-                    <div class="feature-title">Verbesserte Benutzeroberfläche</div>
+                    <div class="feature-title">Test und Überwachung</div>
                     <div class="feature-description">
-                        <strong>NEU: Optimierte Bedienung</strong>
+                        Umfangreiche Test- und Überwachungsfunktionen für alle Weiterleitungen:
                         <ul>
-                            <li>Moderne Material 3 Design-Elemente</li>
-                            <li>Übersichtliche Darstellung der Weiterleitungsstatus</li>
-                            <li>Separate Tabs für SMS- und Email-Konfiguration</li>
-                            <li>Verbesserte Protokoll-Ansicht mit Farbkodierung</li>
-                            <li>Automatische Erkennung der Ländervorwahl</li>
-                            <li>Optimierte Darstellung für Tablets und Querformat</li>
+                            <li>Test-SMS mit anpassbarem Inhalt</li>
+                            <li>Separate Test-Emails an einzelne Adressen</li>
+                            <li>Detaillierte Protokollierung aller Aktivitäten</li>
+                            <li>Export von Protokollen im CSV-Format</li>
                         </ul>
                     </div>
                 </li>
                 
                 <li class="feature-item">
-                    <div class="feature-title">Erweiterte Protokollierung</div>
+                    <div class="feature-title">Benutzeroberfläche</div>
                     <div class="feature-description">
-                        <strong>NEU: Detailliertes Logging</strong><br>
-                        Alle Weiterleitungsaktivitäten werden nun noch detaillierter protokolliert:
+                        Die Benutzeroberfläche wurde für intuitive Bedienung optimiert:
                         <ul>
-                            <li>Separate Kennzeichnung von SMS- und Email-Weiterleitungen</li>
-                            <li>Zeitstempel mit Millisekunden-Genauigkeit</li>
-                            <li>Erfolgsmeldungen und Fehlerdiagnosen</li>
-                            <li>Export- und Teilfunktion für Protokolle</li>
-                            <li>Automatische Protokollbereinigung</li>
+                            <li>Separate Bereiche für SMS- und Email-Konfiguration</li>
+                            <li>Übersichtliche Statusanzeigen</li>
+                            <li>Farbkodierte Protokollansicht</li>
+                            <li>Anpassung an Tablets und Querformat</li>
                         </ul>
                     </div>
                 </li>
-
+                
                 <li class="feature-item">
                     <div class="feature-title">Sicherheit und Datenschutz</div>
                     <div class="feature-description">
-                        <strong>NEU: Verbesserte Sicherheitsfunktionen</strong>
+                        Die App legt besonderen Wert auf Sicherheit und Datenschutz:
                         <ul>
-                            <li>Verschlüsselte Speicherung aller sensiblen Daten</li>
+                            <li>Verschlüsselte Speicherung sensibler Daten</li>
                             <li>Sichere Handhabung von Email-Zugangsdaten</li>
                             <li>Automatische Bereinigung beim Beenden</li>
-                            <li>Keine Speicherung von SMS-Inhalten</li>
-                            <li>Strikte Berechtigungskontrolle</li>
+                            <li>Keine dauerhafte Speicherung von SMS-Inhalten</li>
                         </ul>
                     </div>
                 </li>
@@ -2830,34 +2763,34 @@ class MainActivity : ComponentActivity() {
 
                 <span class="info-label">JDK:</span>
                 <span class="info-value">${BuildConfig.JDK_VERSION}</span>
- 
             </div>
         </div>
 
         <p class="footnote">
             Die App wurde unter Berücksichtigung moderner Android-Entwicklungspraktiken und Datenschutzrichtlinien entwickelt. 
             Sie läuft energieeffizient im Hintergrund und gewährleistet dabei eine zuverlässige Weiterleitung Ihrer Nachrichten und Anrufe.
-            Die neue Email-Weiterleitungsfunktion erweitert die Möglichkeiten der App erheblich und macht sie noch flexibler einsetzbar.
         </p>
     </body>
     </html>
     """.trimIndent()
     }
-}
 
-// Hilfsfunktion um API Level in Android-Versionsnamen umzuwandeln
-private fun getAndroidVersionName(sdkInt: Int): String {
-    return when (sdkInt) {
-        Build.VERSION_CODES.S_V2 -> "12L/12.1"
-        Build.VERSION_CODES.S -> "12"
-        Build.VERSION_CODES.R -> "11"
-        Build.VERSION_CODES.Q -> "10"
-        Build.VERSION_CODES.P -> "9"
-        Build.VERSION_CODES.O_MR1 -> "8.1"
-        Build.VERSION_CODES.O -> "8.0"
-        Build.VERSION_CODES.N_MR1 -> "7.1"
-        Build.VERSION_CODES.N -> "7.0"
-        Build.VERSION_CODES.M -> "6.0"
-        else -> "Version $sdkInt"
+    private fun getAndroidVersionName(sdkInt: Int): String {
+        return when (sdkInt) {
+            Build.VERSION_CODES.UPSIDE_DOWN_CAKE -> "14"  // API 34
+            Build.VERSION_CODES.TIRAMISU -> "13"          // API 33
+            Build.VERSION_CODES.S_V2 -> "12L/12.1"        // API 32
+            Build.VERSION_CODES.S -> "12"                 // API 31
+            Build.VERSION_CODES.R -> "11"                 // API 30
+            Build.VERSION_CODES.Q -> "10"                 // API 29
+            Build.VERSION_CODES.P -> "9"                  // API 28
+            Build.VERSION_CODES.O_MR1 -> "8.1"           // API 27
+            Build.VERSION_CODES.O -> "8.0"               // API 26
+            Build.VERSION_CODES.N_MR1 -> "7.1"           // API 25
+            Build.VERSION_CODES.N -> "7.0"               // API 24
+            Build.VERSION_CODES.M -> "6.0"               // API 23
+            else -> "Version $sdkInt"
+        }
     }
 }
+

@@ -13,14 +13,17 @@ import android.telephony.SmsManager
 import android.telephony.SubscriptionManager
 import android.telephony.TelephonyManager
 import androidx.core.content.ContextCompat
-import com.google.i18n.phonenumbers.NumberParseException
 import com.google.i18n.phonenumbers.PhoneNumberUtil
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-import javax.mail.*
+import java.util.Properties
+import javax.mail.Authenticator
+import javax.mail.Message
+import javax.mail.PasswordAuthentication
+import javax.mail.Session
+import javax.mail.Transport
 import javax.mail.internet.InternetAddress
 import javax.mail.internet.MimeMessage
-import java.util.Properties
 
 /**
  * PhoneSmsUtils ist eine Utility-Klasse für SMS- und Telefonie-bezogene Funktionen.
@@ -87,8 +90,6 @@ class PhoneSmsUtils private constructor() {
     }
 
     companion object {
-        //private const val TAG = "PhoneSmsUtils"
-        //private lateinit var logger: Logger
 
         fun initialize() {
             LoggingManager.logInfo(
@@ -444,110 +445,119 @@ class PhoneSmsUtils private constructor() {
             }
         }
 
-
-        @SuppressLint("MissingPermission", "ObsoleteSdkInt")
+        @SuppressLint("MissingPermission", "HardwareIds")
         fun getSimCardNumber(context: Context): String {
-            if (!checkPermission(context, Manifest.permission.READ_PHONE_STATE) ||
-                !checkPermission(context, Manifest.permission.READ_PHONE_NUMBERS)
-            ) {
-                LoggingManager.logError(
-                    component = "PhoneSmsUtils",
-                    action = "GET_SIM_NUMBER",
-                    message = "Fehlende Berechtigungen für Telefonnummer",
-                    details = mapOf(
-                        "missing_permissions" to listOf(
-                            "READ_PHONE_STATE",
-                            "READ_PHONE_NUMBERS"
-                        ).joinToString()
-                    )
-                )
+            // Prüfe Berechtigungen
+            val requiredPermissions = arrayOf(
+                Manifest.permission.READ_PHONE_STATE,
+                Manifest.permission.READ_PHONE_NUMBERS
+            )
+
+            if (!requiredPermissions.all { checkPermission(context, it) }) {
+                logError("Fehlende Berechtigungen für Telefonnummer", requiredPermissions)
                 SnackbarManager.showError("Berechtigungen für das Lesen der Telefonnummer fehlen")
                 return ""
             }
 
             return try {
                 val telephonyManager = context.getSystemService(Context.TELEPHONY_SERVICE) as? TelephonyManager
-                val subscriptionManager = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP_MR1) {
-                    context.getSystemService(Context.TELEPHONY_SUBSCRIPTION_SERVICE) as? SubscriptionManager
-                } else null
+                    ?: return ""
 
                 var phoneNumber = ""
 
+                // Strategie 1: Direct Line Number (API 29+)
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    phoneNumber = telephonyManager?.line1Number.orEmpty()
-                }
-
-                if (phoneNumber.isEmpty() && Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP_MR1) {
-                    val activeSubscriptionInfoList = subscriptionManager?.activeSubscriptionInfoList
-                    for (subscriptionInfo in activeSubscriptionInfoList.orEmpty()) {
-                        val number = subscriptionInfo.number
-                        if (!number.isNullOrEmpty()) {
-                            phoneNumber = number
-                            break
-                        }
+                    phoneNumber = telephonyManager.line1Number.orEmpty()
+                    if (phoneNumber.isNotEmpty()) {
+                        logSuccess(phoneNumber, "line1Number")
+                        return formatPhoneNumber(phoneNumber)
                     }
                 }
 
-                if (phoneNumber.isEmpty()) {
-                    LoggingManager.logWarning(
-                        component = "PhoneSmsUtils",
-                        action = "GET_SIM_NUMBER",
-                        message = "Telefonnummer konnte nicht ermittelt werden",
-                        details = mapOf(
-                            "android_version" to Build.VERSION.SDK_INT,
-                            "has_subscription_manager" to (subscriptionManager != null)
-                        )
-                    )
-                } else {
-                    LoggingManager.logInfo(
-                        component = "PhoneSmsUtils",
-                        action = "GET_SIM_NUMBER",
-                        message = "Telefonnummer erfolgreich ermittelt",
-                        details = mapOf(
-                            "number_length" to phoneNumber.length,
-                            "source" to if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) "line1Number" else "subscription_info"
-                        )
-                    )
+                // Strategie 2: Subscription Info (API 22+)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP_MR1) {
+                    val subscriptionManager = context.getSystemService(Context.TELEPHONY_SUBSCRIPTION_SERVICE) as? SubscriptionManager
+                    val number = subscriptionManager?.let { manager ->
+                        manager.activeSubscriptionInfoList?.firstNotNullOfOrNull {
+                            it.number?.takeIf { num -> num.isNotEmpty() }
+                        }
+                    }
+
+                    if (!number.isNullOrEmpty()) {
+                        logSuccess(number, "subscription_info")
+                        return formatPhoneNumber(number)
+                    }
                 }
 
-                phoneNumber
+                // Strategie 4: SIM Seriennummer (nur bei manchen Geräten verfügbar)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    val simSerialNumber = telephonyManager.simSerialNumber.orEmpty()
+                    if (simSerialNumber.matches(Regex("\\d+"))) {
+                        logSuccess(simSerialNumber, "sim_serial")
+                        return formatPhoneNumber(simSerialNumber)
+                    }
+                }
 
-            } catch (e: SecurityException) {
-                LoggingManager.logError(
-                    component = "PhoneSmsUtils",
-                    action = "GET_SIM_NUMBER",
-                    message = "Sicherheitsfehler beim Abrufen der Telefonnummer",
-                    error = e
-                )
-                SnackbarManager.showError("Sicherheitsfehler beim Abrufen der Telefonnummer")
+                logWarning("Telefonnummer konnte nicht ermittelt werden",
+                    listOf("line1Number", "subscription_info", "msisdn", "sim_serial"))
                 ""
 
+            } catch (e: SecurityException) {
+                logError("Sicherheitsfehler beim Abrufen der Telefonnummer", e)
+                SnackbarManager.showError("Sicherheitsfehler beim Abrufen der Telefonnummer")
+                ""
             } catch (e: Exception) {
-                LoggingManager.logError(
-                    component = "PhoneSmsUtils",
-                    action = "GET_SIM_NUMBER",
-                    message = "Fehler beim Abrufen der Telefonnummer",
-                    error = e,
-                    details = mapOf("error_type" to e.javaClass.simpleName)
-                )
+                logError("Fehler beim Abrufen der Telefonnummer", e)
                 SnackbarManager.showError("Fehler beim Abrufen der Telefonnummer: ${e.message}")
                 ""
             }
         }
 
-        /**
-         * Ruft die passende SmsManager-Instanz ab, abhängig von der Android-Version.
-         * @param context Der Anwendungskontext
-         * @return Die SmsManager-Instanz
-         */
-        private fun getSmsManager(context: Context): SmsManager {
-            return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                context.getSystemService(SmsManager::class.java)
-            } else {
-                @Suppress("DEPRECATION")
-                SmsManager.getDefault()
-            }
+        private fun logError(message: String, permissions: Array<String>) {
+            LoggingManager.logError(
+                component = "PhoneSmsUtils",
+                action = "GET_SIM_NUMBER",
+                message = message,
+                details = mapOf("missing_permissions" to permissions.joinToString())
+            )
         }
+
+        private fun logError(message: String, error: Exception) {
+            LoggingManager.logError(
+                component = "PhoneSmsUtils",
+                action = "GET_SIM_NUMBER",
+                message = message,
+                error = error,
+                details = mapOf("error_type" to error.javaClass.simpleName)
+            )
+        }
+
+        private fun logSuccess(number: String, source: String) {
+            LoggingManager.logInfo(
+                component = "PhoneSmsUtils",
+                action = "GET_SIM_NUMBER",
+                message = "Telefonnummer erfolgreich ermittelt",
+                details = mapOf("number_length" to number.length, "source" to source)
+            )
+        }
+
+        private fun logWarning(message: String, methods: List<String>) {
+            LoggingManager.logWarning(
+                component = "PhoneSmsUtils",
+                action = "GET_SIM_NUMBER",
+                message = message,
+                details = mapOf(
+                    "android_version" to Build.VERSION.SDK_INT,
+                    "tried_methods" to methods.joinToString()
+                )
+            )
+        }
+
+        private fun formatPhoneNumber(number: String): String {
+            return number.trim().replace(Regex("^00"), "+").replace(Regex("^0"), "+43")
+                .takeIf { it.matches(Regex("[+\\d]{10,15}")) } ?: number
+        }
+
 
         /**
          * Behandelt Fehler beim Weiterleiten von SMS.
@@ -950,115 +960,6 @@ class PhoneSmsUtils private constructor() {
             }
         }
     }
-
-
-}
-
-
-
-class PhoneNumberValidator {
-    private val phoneUtil = PhoneNumberUtil.getInstance()
-
-    /**
-     * Validiert und formatiert eine Telefonnummer.
-     * @param phoneNumber Die zu validierende Telefonnummer
-     * @param defaultRegion Der Default-Ländercode (z.B. "AT" für Österreich)
-     * @return ValidatedPhoneNumber Objekt mit Validierungsergebnis
-     */
-    fun validatePhoneNumber(phoneNumber: String, defaultRegion: String = "AT"): ValidatedPhoneNumber {
-        try {
-            // Versuche die Nummer zu parsen
-            val numberProto = phoneUtil.parse(phoneNumber, defaultRegion)
-
-            // Prüfe ob es eine valide Nummer ist
-            if (!phoneUtil.isValidNumber(numberProto)) {
-                return ValidatedPhoneNumber(
-                    isValid = false,
-                    errorType = PhoneNumberError.INVALID_NUMBER,
-                    errorMessage = "Keine gültige Telefonnummer"
-                )
-            }
-
-            // Prüfe ob es eine Mobilnummer ist (optional)
-            if (phoneUtil.getNumberType(numberProto) != PhoneNumberUtil.PhoneNumberType.MOBILE) {
-                return ValidatedPhoneNumber(
-                    isValid = false,
-                    errorType = PhoneNumberError.NOT_MOBILE,
-                    errorMessage = "Keine Mobiltelefonnummer"
-                )
-            }
-
-            // Formatiere die Nummer in verschiedenen Formaten
-            val e164Format = phoneUtil.format(numberProto, PhoneNumberUtil.PhoneNumberFormat.E164)
-            val internationalFormat = phoneUtil.format(numberProto, PhoneNumberUtil.PhoneNumberFormat.INTERNATIONAL)
-            val nationalFormat = phoneUtil.format(numberProto, PhoneNumberUtil.PhoneNumberFormat.NATIONAL)
-
-            return ValidatedPhoneNumber(
-                isValid = true,
-                normalizedNumber = e164Format,
-                formattedInternational = internationalFormat,
-                formattedNational = nationalFormat,
-                countryCode = numberProto.countryCode.toString(),
-                numberType = phoneUtil.getNumberType(numberProto)
-            )
-        } catch (e: NumberParseException) {
-            val errorMsg = when (e.errorType) {
-                NumberParseException.ErrorType.INVALID_COUNTRY_CODE -> "Ungültiger Ländercode"
-                NumberParseException.ErrorType.NOT_A_NUMBER -> "Enthält ungültige Zeichen"
-                NumberParseException.ErrorType.TOO_SHORT_AFTER_IDD -> "Nummer zu kurz"
-                NumberParseException.ErrorType.TOO_SHORT_NSN -> "Nummer zu kurz"
-                else -> "Unbekannter Fehler bei der Validierung"
-            }
-            return ValidatedPhoneNumber(
-                isValid = false,
-                errorType = PhoneNumberError.PARSE_ERROR,
-                errorMessage = errorMsg
-            )
-        }
-    }
-
-    /**
-     * Prüft ob zwei Telefonnummern gleich sind (auch bei unterschiedlicher Formatierung)
-     */
-    fun areSameNumber(number1: String, number2: String, defaultRegion: String = "AT"): Boolean {
-        try {
-            val proto1 = phoneUtil.parse(number1, defaultRegion)
-            val proto2 = phoneUtil.parse(number2, defaultRegion)
-            return phoneUtil.isNumberMatch(proto1, proto2) == PhoneNumberUtil.MatchType.EXACT_MATCH
-        } catch (e: NumberParseException) {
-            return false
-        }
-    }
-
-    /**
-     * Extrahiert den Ländercode aus einer Telefonnummer
-     */
-    fun extractCountryCode(phoneNumber: String, defaultRegion: String = "AT"): String? {
-        try {
-            val numberProto = phoneUtil.parse(phoneNumber, defaultRegion)
-            return "+" + numberProto.countryCode.toString()
-        } catch (e: NumberParseException) {
-            return null
-        }
-    }
-}
-
-data class ValidatedPhoneNumber(
-    val isValid: Boolean,
-    val normalizedNumber: String? = null,
-    val formattedInternational: String? = null,
-    val formattedNational: String? = null,
-    val countryCode: String? = null,
-    val numberType: PhoneNumberUtil.PhoneNumberType? = null,
-    val errorType: PhoneNumberError? = null,
-    val errorMessage: String? = null
-)
-
-enum class PhoneNumberError {
-    PARSE_ERROR,
-    INVALID_NUMBER,
-    NOT_MOBILE,
-    UNKNOWN
 }
 
 data class PhoneNumberResult(
@@ -1296,112 +1197,10 @@ class PhoneNumberFormatter {
     private fun getSwissCarrierInfo(nationalNumber: String): Pair<String?, String> =
         swissMobileTrie.findLongestPrefix(nationalNumber)
 
-    fun isMobileNumber(phoneNumber: String, defaultRegion: String = "AT"): Boolean {
-        return try {
-            val numberProto = phoneUtil.parse(phoneNumber, defaultRegion)
-            phoneUtil.getNumberType(numberProto) == PhoneNumberUtil.PhoneNumberType.MOBILE
-        } catch (e: Exception) {
-            false
-        }
-    }
 }
-
-
-class SimStatusChecker(private val context: Context) {
-
-    /**
-     * Datenklasse für das Ergebnis der SIM-Überprüfung
-     * @property hasCellularSupport Gibt an, ob das Gerät grundsätzlich Mobilfunk unterstützt
-     * @property hasSimCard Gibt an, ob eine SIM-Karte eingelegt ist
-     * @property errorMessage Enthält ggf. eine Fehlermeldung
-     */
-    data class SimStatus(
-        val hasCellularSupport: Boolean = false,
-        val hasSimCard: Boolean = false,
-        val errorMessage: String? = null
-    )
-
-    /**
-     * Prüft den Status der SIM-Karte und Mobilfunkfähigkeit des Geräts
-     * @return SimStatus Objekt mit den Ergebnissen
-     */
-    fun checkSimStatus(): SimStatus {
-        try {
-            // Hole TelephonyManager System Service
-            val telephonyManager = context.getSystemService(Context.TELEPHONY_SERVICE) as? TelephonyManager
-                ?: return SimStatus(
-                    errorMessage = "TelephonyManager konnte nicht initialisiert werden"
-                )
-
-            // Prüfe ob das Gerät grundsätzlich Mobilfunk unterstützt
-            val hasCellularSupport = context.packageManager
-                .hasSystemFeature(PackageManager.FEATURE_TELEPHONY)
-
-            // Wenn kein Mobilfunk unterstützt wird, können wir hier schon beenden
-            if (!hasCellularSupport) {
-                return SimStatus(
-                    hasCellularSupport = false,
-                    hasSimCard = false
-                )
-            }
-
-            // Ab Android 10 unterschiedliche Methoden zur SIM-Erkennung
-            val hasSimCard = when {
-                // Ab Android 10
-                Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q -> {
-                    checkSimStatusApi29Plus(context)
-                }
-                // Für Android 10
-                else -> {
-                    telephonyManager.simState == TelephonyManager.SIM_STATE_READY
-                }
-            }
-
-            return SimStatus(
-                hasCellularSupport = true,
-                hasSimCard = hasSimCard
-            )
-
-        } catch (e: Exception) {
-            return SimStatus(
-                errorMessage = "Fehler bei der SIM-Überprüfung: ${e.message}"
-            )
-        }
-    }
-
-    /**
-     * Prüft den SIM-Status für Android API 29 (Android 10) und höher
-     * @param context Der Application Context
-     * @return Boolean true wenn eine aktive SIM erkannt wurde
-     */
-    private fun checkSimStatusApi29Plus(context: Context): Boolean {
-        // Prüfe READ_PHONE_STATE Berechtigung
-        if (ContextCompat.checkSelfPermission(
-                context,
-                Manifest.permission.READ_PHONE_STATE
-            ) != PackageManager.PERMISSION_GRANTED
-        ) {
-            return false
-        }
-
-        val subscriptionManager = context.getSystemService(Context.TELEPHONY_SUBSCRIPTION_SERVICE) as? SubscriptionManager
-            ?: return false
-
-        // Prüfe ob aktive Subscriptions vorhanden sind
-        return try {
-            val activeSubscriptionInfoCount = subscriptionManager.activeSubscriptionInfoCount
-            activeSubscriptionInfoCount > 0
-        } catch (e: Exception) {
-            false
-        }
-    }
-}
-
-
-
 
 sealed class EmailResult {
-    object Success : EmailResult()
+    data object Success : EmailResult()
     data class Error(val message: String) : EmailResult()
 }
 
@@ -1454,15 +1253,5 @@ class EmailSender(
         } catch (e: Exception) {
             EmailResult.Error("Fehler beim E-Mail-Versand: ${e.message}")
         }
-    }
-
-    companion object {
-        // Vordefinierte Konfigurationen für gängige Provider
-        fun createGmailSender(username: String, password: String) = EmailSender(
-            host = "smtp.gmail.com",
-            port = 587,
-            username = username,
-            password = password
-        )
     }
 }

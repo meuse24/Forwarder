@@ -2,6 +2,7 @@ package info.meuse24.smsforwarderneo
 
 import android.app.Application
 import android.content.ComponentCallbacks2
+import android.content.Context
 import android.util.Log
 import androidx.compose.material3.SnackbarDuration
 import androidx.compose.material3.SnackbarHostState
@@ -11,143 +12,193 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import java.util.concurrent.atomic.AtomicBoolean
+
+typealias LogLevel = Logger.LogLevel
+
+typealias LogMetadata = Logger.LogMetadata
+
+object AppContainer {
+    private lateinit var application: SmsForwarderApplication
+    private var activity: MainActivity? = null // Optional statt lateinit
+
+    private val _isBasicInitialized = MutableStateFlow(false)
+    val isBasicInitialized = _isBasicInitialized.asStateFlow() // Public StateFlow
+
+    private val _isFullyInitialized = MutableStateFlow(false)
+    val isInitialized = _isFullyInitialized.asStateFlow()
 
 
-class SmsForwarderApplication : Application() {
     lateinit var logger: Logger
         private set
 
-    lateinit var loggingHelper: LoggingHelper
+    lateinit var prefsManager: SharedPreferencesManager
         private set
 
-    private val _isReady = MutableStateFlow(false)
-    val isReady: StateFlow<Boolean> = _isReady.asStateFlow()
+    lateinit var permissionHandler: PermissionHandler
+        private set
 
+    private lateinit var phoneUtils: PhoneSmsUtils.Companion
+
+    fun initializeCritical(app: SmsForwarderApplication) {
+        Log.d("AppContainer", "Starting critical initialization")
+        application = app
+        logger = Logger(app)
+        prefsManager = SharedPreferencesManager(app)
+        PhoneSmsUtils.initialize()
+        phoneUtils = PhoneSmsUtils
+        _isBasicInitialized.value = true
+        Log.d("AppContainer", "Critical initialization complete")
+    }
+
+    fun initializeWithActivity(mainActivity: MainActivity) {
+        Log.d("AppContainer", "Starting activity-dependent initialization")
+        try {
+            activity = mainActivity
+            permissionHandler = PermissionHandler(mainActivity)
+            _isFullyInitialized.value = true
+            Log.d("AppContainer", "Full initialization complete")
+        } catch (e: Exception) {
+            Log.e("AppContainer", "Error in activity initialization", e)
+            throw e
+        }
+    }
+
+    // Hilfsmethode zum Prüfen des Initialisierungsstatus
+    fun isBasicInitialized() = _isBasicInitialized.value
+
+    fun getApplication(): SmsForwarderApplication = application
+}
+
+class SmsForwarderApplication : Application() {
     private val applicationScope = CoroutineScope(Job() + Dispatchers.Default)
 
     override fun onCreate() {
         super.onCreate()
         instance = this
 
-        // Starte Initialisierung in einer Coroutine
-        applicationScope.launch {
-            try {
-                initializeLogging()
-                _isReady.value = true
-            } catch (e: Exception) {
-                Log.e("Application", "Fehler bei der Initialisierung", e)
-            }
+        // Nur Basis-Initialisierung
+        initializeCriticalComponents()
+        initializeBaseComponents()  // Add this call
+    }
+
+    private fun initializeCriticalComponents() {
+        try {
+            AppContainer.initializeCritical(this)
+        } catch (e: Exception) {
+            Log.e("SmsForwarderApplication", "Critical initialization failed", e)
+            throw e
         }
     }
 
-    override fun onTerminate() {
-        super.onTerminate()
-        applicationScope.coroutineContext.cancel()
-    }
-    private  fun initializeLogging() {
+    private fun initializeBaseComponents() {
         try {
-            logger = Logger(this)
-            loggingHelper = LoggingHelper(logger)
+            // Initialize LoggingManager with Application context
+            LoggingManager.initialize(this)  // 'this' ist der Application context
 
-            // Initial Log-Eintrag
+            // Add initial log entry after proper initialization
             LoggingManager.logInfo(
                 component = "Application",
                 action = "INIT",
-                message = "SMS Forwarder Application gestartet",
-                details = mapOf(
-                    "version" to BuildConfig.VERSION_NAME,
-                    "build_type" to BuildConfig.BUILD_TYPE,
-                    "timestamp" to System.currentTimeMillis()
-                )
+                message = "Base components initialized successfully"
             )
         } catch (e: Exception) {
-            Log.e(TAG, "Fehler bei der Logging-Initialisierung", e)
+            Log.e("SmsForwarderApplication", "Base initialization failed", e)
+            throw e
         }
+    }
+
+
+    override fun onTerminate() {
+        super.onTerminate()
+        applicationScope.cancel()
+        LoggingManager.logInfo(
+            component = "Application",
+            action = "TERMINATE",
+            message = "Application is terminating"
+        )
     }
 
     override fun onLowMemory() {
         super.onLowMemory()
-
-        // Asynchrones Logging mit applicationScope
-
-            LoggingManager.logWarning(
-                component = "Application",
-                action = "LOW_MEMORY",
-                message = "Gerät hat wenig Arbeitsspeicher",
-                details = mapOf(
-                    "free_memory" to Runtime.getRuntime().freeMemory(),
-                    "total_memory" to Runtime.getRuntime().totalMemory()
-                )
+        LoggingManager.logWarning(
+            component = "Application",
+            action = "LOW_MEMORY",
+            message = "System reports low memory",
+            details = mapOf(
+                "free_memory" to Runtime.getRuntime().freeMemory(),
+                "total_memory" to Runtime.getRuntime().totalMemory()
             )
-
+        )
     }
 
     override fun onTrimMemory(level: Int) {
         super.onTrimMemory(level)
-
         if (level >= ComponentCallbacks2.TRIM_MEMORY_MODERATE) {
-            // Asynchrones Logging im applicationScope
-
-                LoggingManager.logWarning(
-                    component = "Application",
-                    action = "TRIM_MEMORY",
-                    message = "System fordert Speicherbereinigung an",
-                    details = mapOf("level" to level)
-                )
-
+            LoggingManager.logWarning(
+                component = "Application",
+                action = "TRIM_MEMORY",
+                message = "System requests memory trim",
+                details = mapOf("level" to level)
+            )
         }
     }
 
     companion object {
-        private const val TAG = "SmsForwarderApp"
-
         @Volatile
         private var instance: SmsForwarderApplication? = null
 
-        fun getInstance(): SmsForwarderApplication {
-            return instance ?: throw IllegalStateException(
-                "Application nicht initialisiert"
-            )
-        }
     }
 }
 
 object LoggingManager {
-    private val scope = CoroutineScope(Job() + Dispatchers.Default)
+    private lateinit var logger: Logger
+    private val initialized = AtomicBoolean(false)
 
+    fun initialize(context: Context) {
+        logger = Logger(context)
+        initialized.set(true)
 
-    private val loggingHelper: LoggingHelper
-        get() = SmsForwarderApplication.getInstance().loggingHelper
-
-    // Allgemeine log-Funktion mit gleicher Signatur wie LoggingHelper
-     fun log(
-        level: LoggingHelper.LogLevel,
-        metadata: LoggingHelper.LogMetadata,
+        logInfo(
+            component = "LoggingManager",
+            action = "INIT",
+            message = "Logging system initialized"
+        )
+    }
+    fun log(
+        level: LogLevel,
+        metadata: LogMetadata,
         message: String,
         throwable: Throwable? = null
     ) {
+        if (!initialized.get()) {
+            Log.e("LoggingManager", "Logging before initialization: $message")
+            return
+        }
+
         try {
-            scope.launch {
-                loggingHelper.log(level, metadata, message, throwable)
-            }
+            logger.log(level, metadata, message, throwable)
         } catch (e: Exception) {
-            Log.e("LoggingManager", "Fehler beim Logging: ${e.message}", e)
+            Log.e("LoggingManager", "Logging error: ${e.message}", e)
         }
     }
 
-    // Bestehende spezifische Logging-Methoden bleiben erhalten
     fun logInfo(
         component: String,
         action: String,
         message: String,
         details: Map<String, Any?> = emptyMap()
     ) {
-        log(
-            LoggingHelper.LogLevel.INFO,
-            LoggingHelper.LogMetadata(component, action, details),
+        if (!initialized.get()) {
+            Log.e("LoggingManager", "Logging before initialization: $message")
+            return
+        }
+
+        logger.log(
+            Logger.LogLevel.INFO,
+            Logger.LogMetadata(component, action, details),
             message
         )
     }
@@ -158,9 +209,11 @@ object LoggingManager {
         message: String,
         details: Map<String, Any?> = emptyMap()
     ) {
-        log(
-            LoggingHelper.LogLevel.WARNING,
-            LoggingHelper.LogMetadata(component, action, details),
+        if (!initialized.get()) return
+
+        logger.log(
+            Logger.LogLevel.WARNING,
+            Logger.LogMetadata(component, action, details),
             message
         )
     }
@@ -172,9 +225,11 @@ object LoggingManager {
         error: Throwable? = null,
         details: Map<String, Any?> = emptyMap()
     ) {
-        log(
-            LoggingHelper.LogLevel.ERROR,
-            LoggingHelper.LogMetadata(component, action, details),
+        if (!initialized.get()) return
+
+        logger.log(
+            Logger.LogLevel.ERROR,
+            Logger.LogMetadata(component, action, details),
             message,
             error
         )
@@ -186,14 +241,15 @@ object LoggingManager {
         message: String,
         details: Map<String, Any?> = emptyMap()
     ) {
-        log(
-            LoggingHelper.LogLevel.DEBUG,
-            LoggingHelper.LogMetadata(component, action, details),
+        if (!initialized.get()) return
+
+        logger.log(
+            Logger.LogLevel.DEBUG,
+            Logger.LogMetadata(component, action, details),
             message
         )
     }
 }
-
 
 object SnackbarManager {
 

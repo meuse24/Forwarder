@@ -1,7 +1,5 @@
 package info.meuse24.smsforwarderneo
 
-import android.annotation.SuppressLint
-import android.app.Activity
 import android.app.Application
 import android.content.ContentResolver
 import android.content.Context
@@ -9,20 +7,15 @@ import android.content.Intent
 import android.content.SharedPreferences
 import android.content.pm.PackageManager
 import android.database.ContentObserver
-import android.net.Uri
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
-import android.os.PowerManager
 import android.provider.ContactsContract
-import android.provider.Settings
 import android.util.Log
-import androidx.activity.result.ActivityResultLauncher
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.annotation.VisibleForTesting
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
-import androidx.lifecycle.DefaultLifecycleObserver
-import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
@@ -43,44 +36,58 @@ import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
-import org.w3c.dom.Document
 import org.w3c.dom.Element
 import java.io.File
-import java.io.FileOutputStream
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
+import android.Manifest
+import android.annotation.SuppressLint
+import java.time.LocalDateTime
+import java.time.format.DateTimeFormatter
+import java.util.*
 import javax.xml.parsers.DocumentBuilderFactory
-import javax.xml.transform.OutputKeys
 import javax.xml.transform.TransformerFactory
 import javax.xml.transform.dom.DOMSource
 import javax.xml.transform.stream.StreamResult
+
+data class ContactsState(
+    val isLoading: Boolean = false,
+    val contacts: List<Contact> = emptyList(),
+    val selectedContact: Contact? = null,
+    val forwardingActive: Boolean = false,
+    val selectedPhoneNumber: String = "",
+    val emailForwardingEnabled: Boolean = false,
+    val emailAddresses: List<String> = emptyList(),
+    val error: String? = null
+)
 
 /**
  * ViewModel für die Verwaltung von Kontakten und SMS-Weiterleitungsfunktionen.
  * Implementiert DefaultLifecycleObserver für Lifecycle-bezogene Aktionen.
  */
 @OptIn(FlowPreview::class)
+
 class ContactsViewModel(
     private val application: Application,
     private val prefsManager: SharedPreferencesManager,
     private val logger: Logger
-) : AndroidViewModel(application), DefaultLifecycleObserver {
-
+) : AndroidViewModel(application) {
 
     private val contactsStore = ContactsStore()
+    private val _state = MutableStateFlow(ContactsState())
 
     // StateFlows für verschiedene UI-Zustände
     private val _contacts = MutableStateFlow<List<Contact>>(emptyList())
     val contacts: StateFlow<List<Contact>> = _contacts
 
     private val _isLoading = MutableStateFlow(false)
-    val isLoading: StateFlow<Boolean> = _isLoading
 
     private val _selectedContact = MutableStateFlow<Contact?>(null)
     val selectedContact: StateFlow<Contact?> = _selectedContact
@@ -89,8 +96,6 @@ class ContactsViewModel(
     val forwardingActive: StateFlow<Boolean> = _forwardingActive.asStateFlow()
 
     private val _forwardingPhoneNumber = MutableStateFlow("")
-    val forwardingPhoneNumber: StateFlow<String> = _forwardingPhoneNumber
-
 
     private val _filterText = MutableStateFlow("")
     val filterText: StateFlow<String> = _filterText
@@ -136,7 +141,6 @@ class ContactsViewModel(
 
     private val _isCleaningUp = MutableStateFlow(false)
 
-    // Einmaliges Event für Cleanup-Abschluss
     private val _cleanupCompleted = MutableSharedFlow<Unit>()
     val cleanupCompleted = _cleanupCompleted.asSharedFlow()
 
@@ -147,9 +151,8 @@ class ContactsViewModel(
     val forwardSmsToEmail: StateFlow<Boolean> = _forwardSmsToEmail.asStateFlow()
 
     private val _keepForwardingOnExit = MutableStateFlow(false)
-    val keepForwardingOnExit: StateFlow<Boolean> = _keepForwardingOnExit.asStateFlow()
+    //val keepForwardingOnExit: StateFlow<Boolean> = _keepForwardingOnExit.asStateFlow()
 
-    private var initializationJob: Job? = null
     private val filterMutex = Mutex() // Verhindert parallele Filteroperationen
 
     private val _smtpHost = MutableStateFlow(prefsManager.getSmtpHost())
@@ -164,19 +167,29 @@ class ContactsViewModel(
     private val _smtpPassword = MutableStateFlow(prefsManager.getSmtpPassword())
     val smtpPassword: StateFlow<String> = _smtpPassword.asStateFlow()
 
-    // Neue StateFlow für Test-Email-Text
     private val _testEmailText = MutableStateFlow("")
     val testEmailText: StateFlow<String> = _testEmailText.asStateFlow()
 
-
-
-
+    class Factory : ViewModelProvider.Factory {
+        override fun <T : ViewModel> create(modelClass: Class<T>): T {
+            if (modelClass.isAssignableFrom(ContactsViewModel::class.java)) {
+                val app = AppContainer.getApplication()
+                @Suppress("UNCHECKED_CAST")
+                return ContactsViewModel(
+                    application = app,
+                    prefsManager = AppContainer.prefsManager,
+                    logger = AppContainer.logger
+                ) as T
+            }
+            throw IllegalArgumentException("Unknown ViewModel class")
+        }
+    }
 
     /**
      * Status der Weiterleitung
      */
     sealed class ForwardingResult {
-        object Success : ForwardingResult()
+        data object Success : ForwardingResult()
         data class Error(val message: String, val technical: String? = null) : ForwardingResult()
     }
 
@@ -272,7 +285,7 @@ class ContactsViewModel(
      */
     private suspend fun activateForwardingInternal(contact: Contact): ForwardingResult {
         // Aktiviere Weiterleitung via USSD
-        if (!PhoneSmsUtils.sendUssdCode(getApplication(), "*21*${contact.phoneNumber}#")) {
+        if (!PhoneSmsUtils.sendUssdCode(application, "*21*${contact.phoneNumber}#")) {
             return ForwardingResult.Error("USSD-Code konnte nicht gesendet werden")
         }
 
@@ -304,6 +317,15 @@ class ContactsViewModel(
         }
 
         return ForwardingResult.Success
+    }
+
+    private fun updateNotification(message: String) {
+        viewModelScope.launch {
+            val intent = Intent(AppContainer.getApplication(), SmsForegroundService::class.java)
+            intent.action = "UPDATE_NOTIFICATION"
+            intent.putExtra("contentText", message)
+            AppContainer.getApplication().startService(intent)
+        }
     }
 
     /**
@@ -346,19 +368,21 @@ class ContactsViewModel(
         return ForwardingResult.Success
     }
 
-    // Öffentliche Funktionen für den Zugriff von außen
-    fun activateForwarding(contact: Contact, onResult: (ForwardingResult) -> Unit = {}) {
+    private fun activateForwarding(contact: Contact, onResult: (ForwardingResult) -> Unit = {}) {
         manageForwardingStatus(ForwardingAction.ACTIVATE, contact, onResult)
     }
 
-    fun deactivateForwarding(onResult: (ForwardingResult) -> Unit = {}) {
+    private fun deactivateForwarding(onResult: (ForwardingResult) -> Unit = {}) {
         manageForwardingStatus(ForwardingAction.DEACTIVATE, onResult = onResult)
     }
 
-    fun toggleForwarding(contact: Contact? = null, onResult: (ForwardingResult) -> Unit = {}) {
+    private fun toggleForwarding(contact: Contact? = null, onResult: (ForwardingResult) -> Unit = {}) {
         manageForwardingStatus(ForwardingAction.TOGGLE, contact, onResult)
     }
 
+    fun onShowExitDialog() {
+        _showExitDialog.value = true
+    }
 
     fun updateNewEmailAddress(email: String) {
         _newEmailAddress.value = email
@@ -396,8 +420,8 @@ class ContactsViewModel(
                 _forwardSmsToEmail.value = false
                 prefsManager.setForwardSmsToEmail(false)
                 LoggingManager.log(
-                    LoggingHelper.LogLevel.INFO,
-                    LoggingHelper.LogMetadata(
+                    LogLevel.INFO,
+                    LogMetadata(
                         component = "ContactsViewModel",
                         action = "SMS_EMAIL_FORWARD_AUTO_DISABLE",
                         details = mapOf(
@@ -410,8 +434,8 @@ class ContactsViewModel(
             }
 
             LoggingManager.log(
-                LoggingHelper.LogLevel.INFO,
-                LoggingHelper.LogMetadata(
+                LogLevel.INFO,
+                LogMetadata(
                     component = "ContactsViewModel",
                     action = "REMOVE_EMAIL",
                     details = mapOf(
@@ -425,14 +449,13 @@ class ContactsViewModel(
         }
     }
 
-    // Neue Methode zum Aktualisieren des Test-Email-Texts
     fun updateTestEmailText(newText: String) {
         _testEmailText.value = newText
         prefsManager.saveTestEmailText(newText)
 
         LoggingManager.log(
-            LoggingHelper.LogLevel.DEBUG,
-            LoggingHelper.LogMetadata(
+            LogLevel.DEBUG,
+            LogMetadata(
                 component = "ContactsViewModel",
                 action = "UPDATE_TEST_EMAIL",
                 details = mapOf(
@@ -444,7 +467,6 @@ class ContactsViewModel(
             "Test-Email Text aktualisiert"
         )
     }
-
 
     fun updateSmtpSettings(
         host: String,
@@ -459,9 +481,6 @@ class ContactsViewModel(
         prefsManager.saveSmtpSettings(host, port, username, password)
     }
 
-    // In ContactsViewModel.kt, neue Funktion hinzufügen:
-    // In ContactsViewModel.kt
-
     fun sendTestEmail(mailrecipent: String) {
         viewModelScope.launch {
             try {
@@ -475,8 +494,8 @@ class ContactsViewModel(
                 // Prüfe ob alle erforderlichen SMTP-Einstellungen vorhanden sind
                 if (host.isEmpty() || username.isEmpty() || password.isEmpty()) {
                     LoggingManager.log(
-                        LoggingHelper.LogLevel.WARNING,
-                        LoggingHelper.LogMetadata(
+                        LogLevel.WARNING,
+                        LogMetadata(
                             component = "ContactsViewModel",
                             action = "TEST_EMAIL",
                             details = mapOf(
@@ -509,8 +528,8 @@ class ContactsViewModel(
                 )) {
                     is EmailResult.Success -> {
                         LoggingManager.log(
-                            LoggingHelper.LogLevel.INFO,
-                            LoggingHelper.LogMetadata(
+                            LogLevel.INFO,
+                            LogMetadata(
                                 component = "ContactsViewModel",
                                 action = "TEST_EMAIL_SENT",
                                 details = mapOf(
@@ -526,8 +545,8 @@ class ContactsViewModel(
 
                     is EmailResult.Error -> {
                         LoggingManager.log(
-                            LoggingHelper.LogLevel.ERROR,
-                            LoggingHelper.LogMetadata(
+                            LogLevel.ERROR,
+                            LogMetadata(
                                 component = "ContactsViewModel",
                                 action = "TEST_EMAIL_FAILED",
                                 details = mapOf(
@@ -543,8 +562,8 @@ class ContactsViewModel(
                 }
             } catch (e: Exception) {
                 LoggingManager.log(
-                    LoggingHelper.LogLevel.ERROR,
-                    LoggingHelper.LogMetadata(
+                    LogLevel.ERROR,
+                    LogMetadata(
                         component = "ContactsViewModel",
                         action = "TEST_EMAIL_ERROR",
                         details = mapOf(
@@ -576,17 +595,6 @@ class ContactsViewModel(
             if (contactsList.isEmpty()) {
                 throw AssertionError("Failed to initialize test contacts")
             }
-        }
-    }
-
-    private fun initializeContactsStore() {
-        initializationJob?.cancel()
-        initializationJob = viewModelScope.launch {
-            contactsStore.initialize(
-                contentResolver = application.contentResolver,
-                countryCode = _countryCode.value
-            )
-            // Keine direkte Filterung hier - wird durch _filterText Flow getriggert
         }
     }
 
@@ -641,8 +649,6 @@ class ContactsViewModel(
         }
     }
 
-    // Diese Methode wird beim normalen Beenden aufgerufen
-
     fun deactivateForwarding() {
         if (!_keepForwardingOnExit.value) {
             deactivateForwarding { result ->
@@ -663,8 +669,6 @@ class ContactsViewModel(
         }
     }
 
-
-    // Aktualisierte Methoden für Dialog-Handling
     fun showOwnNumberMissingDialog() {
         _showOwnNumberMissingDialog.value = true
     }
@@ -673,16 +677,10 @@ class ContactsViewModel(
         _showOwnNumberMissingDialog.value = false
     }
 
-    // Error States als sealed class
     sealed class ErrorDialogState {
         data class DeactivationError(val message: String) : ErrorDialogState()
         data object TimeoutError : ErrorDialogState()
         data class GeneralError(val error: Exception) : ErrorDialogState()
-    }
-
-    // Dialog Control Functions
-    fun showExitDialog() {
-        _showExitDialog.value = true
     }
 
     fun hideExitDialog() {
@@ -696,81 +694,162 @@ class ContactsViewModel(
 
     init {
         viewModelScope.launch {
-            // Initialisierung aus init-Block
-            initializeCountryCode()
-            initializeContactsStore()
-            _forwardingActive.value = prefsManager.isForwardingActive()
-            _forwardingPhoneNumber.value = prefsManager.getSelectedPhoneNumber()
-            _testEmailText.value = prefsManager.getTestEmailText()
-            _testSmsText.value = prefsManager.getTestSmsText()
-            _topBarTitle.value = prefsManager.getTopBarTitle()
-            _filterText.value = prefsManager.getFilterText()
-            _emailAddresses.value = prefsManager.getEmailAddresses()
-            _ownPhoneNumber.value = prefsManager.getOwnPhoneNumber()
-            updateForwardingStatus(prefsManager.isForwardingActive())
-
-            contactsStore.contacts.first { it.isNotEmpty() }
-
-            val (savedPhoneNumber, isActive) = prefsManager.getSelectedContact()
-            if (savedPhoneNumber != null && isActive) {
-                // Finde den zugehörigen Kontakt
-                val contact = contacts.value.find { it.phoneNumber == savedPhoneNumber }
-                if (contact != null) {
-                    _selectedContact.value = contact
-                    _forwardingActive.value = true
-                    // Aktiviere die Weiterleitung auch auf Telefonebene
-                    if (PhoneSmsUtils.sendUssdCode(application, "*21*${contact.phoneNumber}#")) {
-                        updateNotification("Weiterleitung aktiv zu ${contact.name} (${contact.phoneNumber})")
-                    }
+            // Beobachte Filtertext-Änderungen
+            _filterText
+                .debounce(300) // Wartet 300ms nach der letzten Änderung
+                .collect { filterText ->
+                    applyCurrentFilter()
                     LoggingManager.logInfo(
                         component = "ContactsViewModel",
-                        action = "RESTORE_STATE",
-                        message = "Weiterleitungszustand wiederhergestellt",
+                        action = "FILTER_APPLIED",
+                        message = "Kontaktfilter angewendet",
                         details = mapOf(
-                            "contact" to contact.name,
-                            "number" to savedPhoneNumber
+                            "filter_text" to filterText,
+                            "results_count" to _contacts.value.size
                         )
                     )
-                } else {
-                    // Falls der Kontakt nicht mehr existiert, setze alles zurück
-                    prefsManager.clearSelection()
-                    _selectedContact.value = null
-                    _forwardingActive.value = false
-                    LoggingManager.logWarning(
-                        component = "ContactsViewModel",
-                        action = "RESTORE_STATE",
-                        message = "Gespeicherter Kontakt nicht mehr verfügbar",
-                        details = mapOf("number" to savedPhoneNumber)
-                    )
                 }
-            }
-            //checkForwardingStatus()
+        }
 
-            updateKeepForwardingOnExit(prefsManager.getKeepForwardingOnExit())
+        // Bestehende Initialisierung
+        initialize()
+    }
 
-            LoggingManager.log(
-                LoggingHelper.LogLevel.INFO,
-                LoggingHelper.LogMetadata(
+    fun updateFilterText(newFilter: String) {
+        _filterText.value = newFilter
+        viewModelScope.launch {
+            applyCurrentFilter()  // Direkter Aufruf für sofortige Aktualisierung
+        }
+        prefsManager.saveFilterText(newFilter)
+    }
+
+    fun initialize() {
+        viewModelScope.launch {
+            try {
+                _isLoading.value = true
+
+                // Lade gespeicherte Einstellungen
+                loadSavedState()
+
+                // Wenn keine Telefonnummer vorhanden, versuche sie zu ermitteln
+                if (_ownPhoneNumber.value.isEmpty()) {
+                    loadOwnPhoneNumber(application)
+                }
+
+                // Initialisiere Ländercode zuerst
+                initializeCountryCode()
+
+                // Initialisiere ContactsStore
+                contactsStore.initialize(
+                    contentResolver = application.contentResolver,
+                    countryCode = _countryCode.value
+                )
+
+                // Starte Collection in separatem Launch-Block
+                viewModelScope.launch {
+                    contactsStore.contacts.collect { contactsList ->
+                        _contacts.value = contactsList
+                    }
+                }
+
+                LoggingManager.logInfo(
                     component = "ContactsViewModel",
-                    action = "INIT_APP",
-                    details = mapOf("timestamp" to System.currentTimeMillis())
-                ),
-                "App-Initialisierung gestartet"
-            )
-            reloadLogs()
-
-
-            // Zentraler Filter-Flow
-            _filterText
-                .debounce(300)
-                .collect { _ ->
-                    applyCurrentFilter()
-                }
+                    action = "INIT",
+                    message = "ViewModel erfolgreich initialisiert"
+                )
+            } catch (e: Exception) {
+                LoggingManager.logError(
+                    component = "ContactsViewModel",
+                    action = "INIT_ERROR",
+                    message = "ViewModel Initialisierung fehlgeschlagen",
+                    error = e
+                )
+            } finally {
+                _isLoading.value = false
+            }
         }
     }
 
-    // In der initializeCountryCode Methode
+    private fun loadSavedState() {
+        _state.update { currentState ->
+            currentState.copy(
+                forwardingActive = prefsManager.isForwardingActive(),
+                selectedPhoneNumber = prefsManager.getSelectedPhoneNumber(),
+                emailForwardingEnabled = prefsManager.isForwardSmsToEmail(),
+                emailAddresses = prefsManager.getEmailAddresses()
+            )
+        }
+        _filterText.value = prefsManager.getFilterText()
+        _testSmsText.value = prefsManager.getTestSmsText()
+        _testEmailText.value = prefsManager.getTestEmailText()
+        _ownPhoneNumber.value = prefsManager.getOwnPhoneNumber()
+        _topBarTitle.value = prefsManager.getTopBarTitle()
+        _smtpHost.value = prefsManager.getSmtpHost()
+        _smtpPort.value = prefsManager.getSmtpPort()
+        _smtpUsername.value = prefsManager.getSmtpUsername()
+        _smtpPassword.value = prefsManager.getSmtpPassword()
+        _countryCode.value = prefsManager.getCountryCode()
+        _forwardSmsToEmail.value = prefsManager.isForwardSmsToEmail()
+        _emailAddresses.value = prefsManager.getEmailAddresses()
+        _forwardingActive.value = prefsManager.isForwardingActive()
+        val savedPhoneNumber = prefsManager.getSelectedPhoneNumber()
+        _forwardingPhoneNumber.value = savedPhoneNumber
+
+        // Starte einen Coroutine-Scope um auf die Kontaktliste zu warten
+        viewModelScope.launch {
+            contacts.first { it.isNotEmpty() }.find { contact ->
+                PhoneSmsUtils.standardizePhoneNumber(contact.phoneNumber, _countryCode.value) ==
+                        PhoneSmsUtils.standardizePhoneNumber(savedPhoneNumber, _countryCode.value)
+            }?.let { foundContact ->
+                _selectedContact.value = foundContact
+                LoggingManager.logInfo(
+                    component = "ContactsViewModel",
+                    action = "RESTORE_CONTACT",
+                    message = "Gespeicherter Kontakt wiederhergestellt",
+                    details = mapOf(
+                        "contact" to foundContact.name,
+                        "number" to foundContact.phoneNumber,
+                        "forwarding_active" to _forwardingActive.value
+                    )
+                )
+            }
+
+            // Validiere den wiederhergestellten Zustand
+            validateRestoredState()
+        }
+    }
+
+    private fun validateRestoredState() {
+        viewModelScope.launch {
+            val hasSelectedContact = _selectedContact.value != null
+            val isForwarding = _forwardingActive.value
+
+            when {
+                isForwarding && !hasSelectedContact -> {
+                    _forwardingActive.value = false
+                    prefsManager.saveForwardingStatus(false)
+                    LoggingManager.logWarning(
+                        component = "ContactsViewModel",
+                        action = "VALIDATE_STATE",
+                        message = "Inkonsistenter Status korrigiert",
+                        details = mapOf(
+                            "reason" to "no_contact_but_active"
+                        )
+                    )
+                }
+                !isForwarding && hasSelectedContact -> {
+                    LoggingManager.logInfo(
+                        component = "ContactsViewModel",
+                        action = "VALIDATE_STATE",
+                        message = "Kontakt beibehalten, Weiterleitung inaktiv"
+                    )
+                }
+            }
+        }
+    }
+
     private fun initializeCountryCode() {
+
         viewModelScope.launch {
             try {
                 // 1. Erste Priorität: SIM-Karte
@@ -779,8 +858,8 @@ class ContactsViewModel(
                     updateCountryCode(simCode)
                     _countryCodeSource.value = "SIM-Karte"
                     LoggingManager.log(
-                        LoggingHelper.LogLevel.INFO,
-                        LoggingHelper.LogMetadata(
+                        LogLevel.INFO,
+                        LogMetadata(
                             component = "ContactsViewModel",
                             action = "COUNTRY_CODE_INIT",
                             details = mapOf(
@@ -804,8 +883,8 @@ class ContactsViewModel(
                             updateCountryCode(detectedCode)
                             _countryCodeSource.value = "Eigene Telefonnummer"
                             LoggingManager.log(
-                                LoggingHelper.LogLevel.INFO,
-                                LoggingHelper.LogMetadata(
+                                LogLevel.INFO,
+                                LogMetadata(
                                     component = "ContactsViewModel",
                                     action = "COUNTRY_CODE_INIT",
                                     details = mapOf(
@@ -819,8 +898,8 @@ class ContactsViewModel(
                         }
                     } catch (e: Exception) {
                         LoggingManager.log(
-                            LoggingHelper.LogLevel.WARNING,
-                            LoggingHelper.LogMetadata(
+                            LogLevel.WARNING,
+                            LogMetadata(
                                 component = "ContactsViewModel",
                                 action = "COUNTRY_CODE_DETECTION_FAILED",
                                 details = mapOf(
@@ -837,8 +916,8 @@ class ContactsViewModel(
                 updateCountryCode("+43")
                 _countryCodeSource.value = "Standard (Österreich)"
                 LoggingManager.log(
-                    LoggingHelper.LogLevel.INFO,
-                    LoggingHelper.LogMetadata(
+                    LogLevel.INFO,
+                    LogMetadata(
                         component = "ContactsViewModel",
                         action = "COUNTRY_CODE_INIT",
                         details = mapOf(
@@ -851,8 +930,8 @@ class ContactsViewModel(
 
             } catch (e: Exception) {
                 LoggingManager.log(
-                    LoggingHelper.LogLevel.ERROR,
-                    LoggingHelper.LogMetadata(
+                    LogLevel.ERROR,
+                    LogMetadata(
                         component = "ContactsViewModel",
                         action = "COUNTRY_CODE_INIT_ERROR",
                         details = mapOf(
@@ -888,11 +967,6 @@ class ContactsViewModel(
         contactsStore.updateCountryCode(code)
     }
 
-    // Anpassung der Telefonnummer-Standardisierung
-    private fun standardizePhoneNumber(number: String): String {
-        return PhoneSmsUtils.standardizePhoneNumber(number, _countryCode.value)
-    }
-
     fun navigateToSettings() {
         _navigationTarget.value = "setup"
     }
@@ -901,15 +975,14 @@ class ContactsViewModel(
         _navigationTarget.value = null
     }
 
-
     override fun onCleared() {
         super.onCleared()
         viewModelScope.launch {
             contactsStore.cleanup()
             saveCurrentState()
             LoggingManager.log(
-                LoggingHelper.LogLevel.INFO,
-                LoggingHelper.LogMetadata(
+                LogLevel.INFO,
+                LogMetadata(
                     component = "ContactsViewModel",
                     action = "VIEWMODEL_CLEARED",
                     details = mapOf("state" to "saved")
@@ -919,9 +992,6 @@ class ContactsViewModel(
         }
     }
 
-    /**
-     * Lädt die Log-Einträge neu.
-     */
     fun reloadLogs() {
         viewModelScope.launch {
             _logEntriesHtml.value = logger.getLogEntriesHtml()
@@ -938,8 +1008,8 @@ class ContactsViewModel(
         _ownPhoneNumber.value = number
         prefsManager.saveOwnPhoneNumber(number)
         LoggingManager.log(
-            LoggingHelper.LogLevel.INFO,
-            LoggingHelper.LogMetadata(
+            LogLevel.INFO,
+            LogMetadata(
                 component = "ContactsViewModel",
                 action = "UPDATE_PHONE_NUMBER",
                 details = mapOf(
@@ -949,12 +1019,6 @@ class ContactsViewModel(
             ),
             "Eigene Telefonnummer aktualisiert"
         )
-    }
-
-    fun loadOwnPhoneNumberIfEmpty(context: Context) {
-        if (_ownPhoneNumber.value.isEmpty()) {
-            loadOwnPhoneNumber(context)
-        }
     }
 
     private fun loadOwnPhoneNumber(context: Context) {
@@ -985,7 +1049,7 @@ class ContactsViewModel(
                     details = mapOf(
                         "contact" to currentContact.name,
                         "number" to currentContact.phoneNumber,
-                        "is_active" to isActive
+                        "is_active" to true
                     )
                 )
                 prefsManager.saveSelectedPhoneNumber(currentContact.phoneNumber)
@@ -1117,34 +1181,8 @@ class ContactsViewModel(
         }
     }
 
-    /**
-     * Aktualisiert den Filtertext für Kontakte.
-     */
-    fun updateFilterText(newFilter: String) {
-        val oldFilter = _filterText.value
-        _filterText.value = newFilter
-        prefsManager.saveFilterText(newFilter)
-
-        if (oldFilter != newFilter) {
-            LoggingManager.log(
-                LoggingHelper.LogLevel.DEBUG,
-                LoggingHelper.LogMetadata(
-                    component = "ContactsViewModel",
-                    action = "UPDATE_FILTER",
-                    details = mapOf(
-                        "old_length" to oldFilter.length,
-                        "new_length" to newFilter.length,
-                        "is_clearing" to newFilter.isEmpty()
-                    )
-                ),
-                "Kontaktfilter aktualisiert"
-            )
-        }
-    }
-
     // Optimierte applyCurrentFilter mit Mutex
-
-    private suspend fun applyCurrentFilter() {
+    suspend fun applyCurrentFilter() {
         filterMutex.withLock {
             val startTime = System.currentTimeMillis()
             _isLoading.value = true
@@ -1153,8 +1191,8 @@ class ContactsViewModel(
                 _contacts.value = filteredContacts
 
                 LoggingManager.log(
-                    LoggingHelper.LogLevel.DEBUG,
-                    LoggingHelper.LogMetadata(
+                    LogLevel.DEBUG,
+                    LogMetadata(
                         component = "ContactsViewModel",
                         action = "APPLY_FILTER",
                         details = mapOf(
@@ -1174,8 +1212,8 @@ class ContactsViewModel(
                     }
                     if (_selectedContact.value == null) {
                         LoggingManager.log(
-                            LoggingHelper.LogLevel.INFO,
-                            LoggingHelper.LogMetadata(
+                            LogLevel.INFO,
+                            LogMetadata(
                                 component = "ContactsViewModel",
                                 action = "SELECTED_CONTACT_FILTERED",
                                 details = mapOf(
@@ -1188,8 +1226,8 @@ class ContactsViewModel(
                 }
             } catch (e: Exception) {
                 LoggingManager.log(
-                    LoggingHelper.LogLevel.ERROR,
-                    LoggingHelper.LogMetadata(
+                    LogLevel.ERROR,
+                    LogMetadata(
                         component = "ContactsViewModel",
                         action = "FILTER_ERROR",
                         details = mapOf(
@@ -1206,11 +1244,9 @@ class ContactsViewModel(
         }
     }
 
-
     /**
      * Aktualisiert den Text für Test-SMS.
      */
-
     fun updateTestSmsText(newText: String) {
         val oldText = _testSmsText.value
         _testSmsText.value = newText
@@ -1218,8 +1254,8 @@ class ContactsViewModel(
 
         if (oldText != newText) {
             LoggingManager.log(
-                LoggingHelper.LogLevel.DEBUG,
-                LoggingHelper.LogMetadata(
+                LogLevel.DEBUG,
+                LogMetadata(
                     component = "ContactsViewModel",
                     action = "UPDATE_TEST_SMS",
                     details = mapOf(
@@ -1233,25 +1269,6 @@ class ContactsViewModel(
         }
     }
 
-    /**
-     * Wählt einen Kontakt aus und aktiviert die Weiterleitung mit Sicherheitsprüfung.
-     */
-    private fun selectContact(contact: Contact?) {
-        if (contact == null) {
-            deactivateForwarding()
-            return
-        }
-        activateForwarding(contact)
-    }
-
-
-    // Bei Änderungen am Weiterleitungsstatus
-    private fun updateForwardingStatus(active: Boolean) {
-        _forwardingActive.value = active
-        prefsManager.saveForwardingStatus(active)
-        updateServiceNotification()
-    }
-
     // Bei Änderungen am Email-Weiterleitungsstatus
     fun updateForwardSmsToEmail(enabled: Boolean) {
         _forwardSmsToEmail.value = enabled
@@ -1260,7 +1277,7 @@ class ContactsViewModel(
     }
 
     private fun updateServiceNotification() {
-        val context = getApplication<Application>()
+
         val status = buildString {
             if (forwardingActive.value) {
                 append("SMS-Weiterleitung aktiv")
@@ -1278,21 +1295,26 @@ class ContactsViewModel(
                 append("Keine Weiterleitung aktiv")
             }
         }
-        SmsForegroundService.updateNotification(context, status)
+
+            viewModelScope.launch {
+                val intent = Intent(AppContainer.getApplication(), SmsForegroundService::class.java)
+                intent.action = "UPDATE_NOTIFICATION"
+                intent.putExtra("contentText", status)
+                AppContainer.getApplication().startService(intent)
+            }
+
     }
 
     /**
      * Sendet eine Test-SMS.
      */
-
-
     fun sendTestSms() {
         val contact = _selectedContact.value
         if (contact != null) {
             if (_ownPhoneNumber.value.isEmpty()) {
                 LoggingManager.log(
-                    LoggingHelper.LogLevel.WARNING,
-                    LoggingHelper.LogMetadata(
+                    LogLevel.WARNING,
+                    LogMetadata(
                         component = "ContactsViewModel",
                         action = "TEST_SMS_FAILED",
                         details = mapOf("reason" to "missing_own_number")
@@ -1311,8 +1333,8 @@ class ContactsViewModel(
                 )
             ) {
                 LoggingManager.log(
-                    LoggingHelper.LogLevel.INFO,
-                    LoggingHelper.LogMetadata(
+                    LogLevel.INFO,
+                    LogMetadata(
                         component = "ContactsViewModel",
                         action = "TEST_SMS_SENT",
                         details = mapOf(
@@ -1324,8 +1346,8 @@ class ContactsViewModel(
                 )
             } else {
                 LoggingManager.log(
-                    LoggingHelper.LogLevel.ERROR,
-                    LoggingHelper.LogMetadata(
+                    LogLevel.ERROR,
+                    LogMetadata(
                         component = "ContactsViewModel",
                         action = "TEST_SMS_FAILED",
                         details = mapOf(
@@ -1338,26 +1360,7 @@ class ContactsViewModel(
             }
         }
     }
-
-    /**
-     * Lädt den gespeicherten Kontakt.
-     */
-    private fun loadSavedContact() {
-        val savedPhoneNumber = prefsManager.getSelectedPhoneNumber()
-        _selectedContact.value = _contacts.value.find { it.phoneNumber == savedPhoneNumber }
     }
-
-    /**
-     * Überprüft den Status der Weiterleitung.
-     */
-//    private fun checkForwardingStatus() {
-//        _forwardingActive.value = prefsManager.isForwardingActive()
-//    }
-
-    private fun updateNotification(message: String) {
-        SmsForegroundService.updateNotification(application, message)
-    }
-}
 
 class ContactsStore {
 
@@ -1409,8 +1412,8 @@ class ContactsStore {
         contentObserver?.let {
             contentResolver.unregisterContentObserver(it)
             LoggingManager.log(
-                LoggingHelper.LogLevel.INFO,
-                LoggingHelper.LogMetadata(
+                LogLevel.INFO,
+                LogMetadata(
                     component = "ContactsStore",
                     action = "UNREGISTER_OBSERVER",
                     details = emptyMap()
@@ -1426,8 +1429,8 @@ class ContactsStore {
                 if (!isUpdating.compareAndSet(false, true)) {
                     scope.launch {
                         LoggingManager.log(
-                            LoggingHelper.LogLevel.INFO,
-                            LoggingHelper.LogMetadata(
+                            LogLevel.INFO,
+                            LogMetadata(
                                 component = "ContactsStore",
                                 action = "CONTACTS_CHANGED_SKIPPED",
                                 details = mapOf("reason" to "update_in_progress")
@@ -1451,8 +1454,8 @@ class ContactsStore {
 
                             val duration = System.currentTimeMillis() - startTime
                             LoggingManager.log(
-                                LoggingHelper.LogLevel.INFO,
-                                LoggingHelper.LogMetadata(
+                                LogLevel.INFO,
+                                LogMetadata(
                                     component = "ContactsStore",
                                     action = "CONTACTS_RELOAD",
                                     details = mapOf(
@@ -1465,8 +1468,8 @@ class ContactsStore {
                         }
                     } catch (e: Exception) {
                         LoggingManager.log(
-                            LoggingHelper.LogLevel.ERROR,
-                            LoggingHelper.LogMetadata(
+                            LogLevel.ERROR,
+                            LogMetadata(
                                 component = "ContactsStore",
                                 action = "CONTACTS_RELOAD_ERROR",
                                 details = mapOf(
@@ -1503,8 +1506,8 @@ class ContactsStore {
                 )
 
                 LoggingManager.log(
-                    LoggingHelper.LogLevel.INFO,
-                    LoggingHelper.LogMetadata(
+                    LogLevel.INFO,
+                    LogMetadata(
                         component = "ContactsStore",
                         action = "REGISTER_OBSERVER",
                         details = mapOf("status" to "success")
@@ -1514,8 +1517,8 @@ class ContactsStore {
             }
         } catch (e: Exception) {
             LoggingManager.log(
-                LoggingHelper.LogLevel.ERROR,
-                LoggingHelper.LogMetadata(
+                LogLevel.ERROR,
+                LogMetadata(
                     component = "ContactsStore",
                     action = "OBSERVER_REGISTRATION_ERROR",
                     details = mapOf(
@@ -1533,38 +1536,38 @@ class ContactsStore {
         contactsMutex.withLock {
             val startTime = System.currentTimeMillis()
             try {
+                LoggingManager.logInfo(
+                    component = "ContactsStore",
+                    action = "LOAD_CONTACTS_START",
+                    message = "Starte Laden der Kontakte"
+                )
+
                 val contacts = readContactsFromProvider(contentResolver)
                 allContacts.clear()
                 allContacts.addAll(contacts)
                 rebuildSearchIndex()
                 _contacts.value = allContacts.toList()
 
-                LoggingManager.log(
-                    LoggingHelper.LogLevel.INFO,
-                    LoggingHelper.LogMetadata(
-                        component = "ContactsStore",
-                        action = "LOAD_CONTACTS",
-                        details = mapOf(
-                            "duration_ms" to (System.currentTimeMillis() - startTime),
-                            "contacts_count" to contacts.size,
-                            "index_size" to searchIndex.size
-                        )
+                LoggingManager.logInfo(
+                    component = "ContactsStore",
+                    action = "LOAD_CONTACTS",
+                    details = mapOf(
+                        "duration_ms" to (System.currentTimeMillis() - startTime),
+                        "contacts_count" to contacts.size,
+                        "index_size" to searchIndex.size
                     ),
-                    "Kontakte erfolgreich geladen"
+                    message = "Kontakte erfolgreich geladen"
                 )
             } catch (e: Exception) {
-                LoggingManager.log(
-                    LoggingHelper.LogLevel.ERROR,
-                    LoggingHelper.LogMetadata(
-                        component = "ContactsStore",
-                        action = "LOAD_CONTACTS_ERROR",
-                        details = mapOf(
-                            "error" to e.message,
-                            "duration_ms" to (System.currentTimeMillis() - startTime)
-                        )
+                LoggingManager.logError(
+                    component = "ContactsStore",
+                    action = "LOAD_CONTACTS_ERROR",
+                    details = mapOf(
+                        "error" to e.message,
+                        "duration_ms" to (System.currentTimeMillis() - startTime)
                     ),
-                    "Fehler beim Laden der Kontakte",
-                    e
+                    message = "Fehler beim Laden der Kontakte",
+                    error = e
                 )
                 throw e
             }
@@ -1602,8 +1605,8 @@ class ContactsStore {
 
             val duration = System.currentTimeMillis() - startTime
             LoggingManager.log(
-                LoggingHelper.LogLevel.DEBUG,
-                LoggingHelper.LogMetadata(
+                LogLevel.DEBUG,
+                LogMetadata(
                     component = "ContactsStore",
                     action = "FILTER_CONTACTS",
                     details = mapOf(
@@ -1642,8 +1645,8 @@ class ContactsStore {
             }
 
             LoggingManager.log(
-                LoggingHelper.LogLevel.INFO,
-                LoggingHelper.LogMetadata(
+                LogLevel.INFO,
+                LogMetadata(
                     component = "ContactsStore",
                     action = "CLEANUP",
                     details = mapOf(
@@ -1654,8 +1657,8 @@ class ContactsStore {
             )
         } catch (e: Exception) {
             LoggingManager.log(
-                LoggingHelper.LogLevel.ERROR,
-                LoggingHelper.LogMetadata(
+                LogLevel.ERROR,
+                LogMetadata(
                     component = "ContactsStore",
                     action = "CLEANUP_ERROR",
                     details = mapOf(
@@ -1673,8 +1676,8 @@ class ContactsStore {
     fun updateCountryCode(newCode: String) {
         if (currentCountryCode != newCode) {
             LoggingManager.log(
-                LoggingHelper.LogLevel.INFO,
-                LoggingHelper.LogMetadata(
+                LogLevel.INFO,
+                LogMetadata(
                     component = "ContactsStore",
                     action = "UPDATE_COUNTRY_CODE",
                     details = mapOf(
@@ -1692,8 +1695,8 @@ class ContactsStore {
                     contentResolver?.let {
                         loadContacts(it)
                         LoggingManager.log(
-                            LoggingHelper.LogLevel.INFO,
-                            LoggingHelper.LogMetadata(
+                            LogLevel.INFO,
+                            LogMetadata(
                                 component = "ContactsStore",
                                 action = "COUNTRY_CODE_UPDATE_COMPLETE",
                                 details = mapOf(
@@ -1705,8 +1708,8 @@ class ContactsStore {
                     }
                 } catch (e: Exception) {
                     LoggingManager.log(
-                        LoggingHelper.LogLevel.ERROR,
-                        LoggingHelper.LogMetadata(
+                        LogLevel.ERROR,
+                        LogMetadata(
                             component = "ContactsStore",
                             action = "COUNTRY_CODE_UPDATE_ERROR",
                             details = mapOf(
@@ -1847,23 +1850,6 @@ class ContactsStore {
 
 }
 
-/**
- * Factory für die Erstellung des ContactsViewModel.
- */
-class ContactsViewModelFactory(
-    private val application: Application,
-    private val prefsManager: SharedPreferencesManager,
-    private val logger: Logger
-) : ViewModelProvider.Factory {
-    override fun <T : ViewModel> create(modelClass: Class<T>): T {
-        if (modelClass.isAssignableFrom(ContactsViewModel::class.java)) {
-            @Suppress("UNCHECKED_CAST")
-            return ContactsViewModel(application, prefsManager, logger) as T
-        }
-        throw IllegalArgumentException("Unknown ViewModel class")
-    }
-}
-
 data class Contact(
     val name: String,
     val phoneNumber: String,
@@ -1922,7 +1908,7 @@ class SharedPreferencesManager(private val context: Context) {
                     is String -> putString(key, value)
                     is Boolean -> putBoolean(key, value)
                     is Int -> putInt(key, value)
-                    is List<*> -> putString(key, (value as List<String>).joinToString(","))
+                    is List<*> -> putString(key, (value as List<*>).joinToString(","))
                     null -> remove(key)
                 }
                 apply()
@@ -1951,14 +1937,14 @@ class SharedPreferencesManager(private val context: Context) {
             action = "SAVE_PHONE_NUMBER",
             message = "Zielrufnummer aktualisiert",
             details = mapOf(
-                "number" to (phoneNumber ?: "null"),
+                "number" to phoneNumber,
                 "forwarding_active" to isForwardingActive()
             )
         )
     }
 
     // Aktiviere Weiterleitung mit Telefonnummer
-    fun activateForwarding(phoneNumber: String) {
+    private fun activateForwarding(phoneNumber: String) {
         require(phoneNumber.isNotEmpty()) { "Telefonnummer darf nicht leer sein" }
         prefs.edit().apply {
             putBoolean(KEY_FORWARDING_ACTIVE, true)
@@ -1974,7 +1960,7 @@ class SharedPreferencesManager(private val context: Context) {
     }
 
     // Deaktiviere Weiterleitung
-    fun deactivateForwarding() {
+    private fun deactivateForwarding() {
         prefs.edit().apply {
             putBoolean(KEY_FORWARDING_ACTIVE, false)
             putString(KEY_SELECTED_PHONE, "")
@@ -1996,12 +1982,6 @@ class SharedPreferencesManager(private val context: Context) {
     fun isForwardingActive(): Boolean =
         prefs.getBoolean(KEY_FORWARDING_ACTIVE, false)
 
-    // Hole aktuelle Weiterleitungsnummer (leer wenn inaktiv)
-    fun getForwardingNumber(): String =
-        if (isForwardingActive()) {
-            prefs.getString(KEY_SELECTED_PHONE, "") ?: ""
-        } else ""
-
     // Keep Forwarding on Exit Funktionen
     fun setKeepForwardingOnExit(keep: Boolean) {
         prefs.edit().putBoolean(KEY_KEEP_FORWARDING_ON_EXIT, keep).apply()
@@ -2011,7 +1991,7 @@ class SharedPreferencesManager(private val context: Context) {
         prefs.getBoolean(KEY_KEEP_FORWARDING_ON_EXIT, false)
 
     // Validiere und repariere inkonsistente Zustände
-    fun validateForwardingState() {
+    private fun validateForwardingState() {
         val isActive = prefs.getBoolean(KEY_FORWARDING_ACTIVE, false)
         val number = prefs.getString(KEY_SELECTED_PHONE, "") ?: ""
 
@@ -2076,41 +2056,6 @@ class SharedPreferencesManager(private val context: Context) {
         }
     }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
     fun saveForwardingStatus(isActive: Boolean) =
         setPreference(KEY_FORWARDING_ACTIVE, isActive)
 
@@ -2131,15 +2076,6 @@ class SharedPreferencesManager(private val context: Context) {
         )
     }
 
-    fun getSelectedContact(): Pair<String, Boolean> {
-        val number = getSelectedPhoneNumber()
-        val isActive = isForwardingActive()
-        return Pair(number, isActive)
-    }
-
-    fun getTestEmailText(): String =
-        getPreference(KEY_TEST_EMAIL_TEXT, "Das ist eine Test-Email.")
-
     fun saveTestEmailText(text: String) =
         setPreference(KEY_TEST_EMAIL_TEXT, text)
 
@@ -2155,44 +2091,23 @@ class SharedPreferencesManager(private val context: Context) {
     fun saveEmailAddresses(emails: List<String>) =
         setPreference(KEY_EMAIL_ADDRESSES, emails)
 
-    fun getCountryCode(defaultCode: String = "+43"): String =
-        getPreference(KEY_COUNTRY_CODE, defaultCode)
-
     fun saveCountryCode(code: String) {
         if (isValidCountryCode(code)) {
             setPreference(KEY_COUNTRY_CODE, code)
         }
     }
 
-    fun getOwnPhoneNumber(): String =
-        getPreference(KEY_OWN_PHONE_NUMBER, "")
-
     fun saveOwnPhoneNumber(number: String) =
         setPreference(KEY_OWN_PHONE_NUMBER, number)
-
-    fun getTopBarTitle(): String =
-        getPreference(KEY_TOP_BAR_TITLE, DEFAULT_TOP_BAR_TITLE)
 
     fun saveTopBarTitle(title: String) =
         setPreference(KEY_TOP_BAR_TITLE, title)
 
-    fun getFilterText(): String =
-        getPreference(KEY_FILTER_TEXT, "")
-
     fun saveFilterText(filterText: String) =
         setPreference(KEY_FILTER_TEXT, filterText)
 
-    fun getTestSmsText(): String =
-        getPreference(KEY_TEST_SMS_TEXT, "Das ist eine Test-SMS.")
-
     fun saveTestSmsText(text: String) =
         setPreference(KEY_TEST_SMS_TEXT, text)
-
-    fun getSmtpHost(): String =
-        getPreference(KEY_SMTP_HOST, DEFAULT_SMTP_HOST)
-
-    fun getSmtpPort(): Int =
-        getPreference(KEY_SMTP_PORT, DEFAULT_SMTP_PORT)
 
     fun getSmtpUsername(): String =
         getPreference(KEY_SMTP_USERNAME, "")
@@ -2210,7 +2125,7 @@ class SharedPreferencesManager(private val context: Context) {
         }
     }
 
-    fun isValidCountryCode(code: String): Boolean =
+    private fun isValidCountryCode(code: String): Boolean =
         code in setOf("+43", "+49", "+41")
 
     private fun initializePreferences(): SharedPreferences {
@@ -2245,8 +2160,8 @@ class SharedPreferencesManager(private val context: Context) {
 
     private fun handlePreferencesError(error: Exception) {
         LoggingManager.log(
-            LoggingHelper.LogLevel.ERROR,
-            LoggingHelper.LogMetadata(
+            LogLevel.ERROR,
+            LogMetadata(
                 component = "SharedPreferencesManager",
                 action = "INIT_ERROR",
                 details = mapOf(
@@ -2263,8 +2178,8 @@ class SharedPreferencesManager(private val context: Context) {
             if (prefsFile.exists()) {
                 prefsFile.delete()
                 LoggingManager.log(
-                    LoggingHelper.LogLevel.INFO,
-                    LoggingHelper.LogMetadata(
+                    LogLevel.INFO,
+                    LogMetadata(
                         component = "SharedPreferencesManager",
                         action = "DELETE_CORRUPTED",
                         details = emptyMap()
@@ -2274,8 +2189,8 @@ class SharedPreferencesManager(private val context: Context) {
             }
         } catch (e: Exception) {
             LoggingManager.log(
-                LoggingHelper.LogLevel.ERROR,
-                LoggingHelper.LogMetadata(
+                LogLevel.ERROR,
+                LogMetadata(
                     component = "SharedPreferencesManager",
                     action = "DELETE_ERROR",
                     details = mapOf("error" to e.message)
@@ -2285,11 +2200,43 @@ class SharedPreferencesManager(private val context: Context) {
         }
     }
 
+
+    fun getTopBarTitle(): String =
+        getPreference(KEY_TOP_BAR_TITLE, DEFAULT_TOP_BAR_TITLE)
+
+    fun getTestSmsText(): String =
+        getPreference(KEY_TEST_SMS_TEXT, DEFAULT_TEST_SMS_TEXT)
+
+    fun getTestEmailText(): String =
+        getPreference(KEY_TEST_EMAIL_TEXT, DEFAULT_TEST_EMAIL_TEXT)
+
+    fun getSmtpHost(): String =
+        getPreference(KEY_SMTP_HOST, DEFAULT_SMTP_HOST)
+
+    fun getSmtpPort(): Int =
+        getPreference(KEY_SMTP_PORT, DEFAULT_SMTP_PORT)
+
+    fun getFilterText(): String =
+        getPreference(KEY_FILTER_TEXT, DEFAULT_FILTER_TEXT)
+
+    fun getOwnPhoneNumber(): String =
+        getPreference(KEY_OWN_PHONE_NUMBER, DEFAULT_OWN_PHONE)
+
+    fun getCountryCode(defaultCode: String = DEFAULT_COUNTRY_CODE): String =
+        getPreference(KEY_COUNTRY_CODE, defaultCode)
+
+    // Neue Methoden hinzufügen:
+    fun setLogPIN(pin: String) =
+        setPreference(KEY_LOG_PIN, pin)
+
+    fun getLogPIN(): String =
+        getPreference(KEY_LOG_PIN, "0000") // Default PIN ist 0000
+
     companion object {
         private const val KEY_TEST_EMAIL_TEXT = "test_email_text"
         private const val KEY_FORWARD_SMS_TO_EMAIL = "forward_sms_to_email"
         private const val KEY_EMAIL_ADDRESSES = "email_addresses"
-
+        private const val KEY_LOG_PIN = "log_pin"
         private const val KEY_FILTER_TEXT = "filter_text"
         private const val KEY_TEST_SMS_TEXT = "test_sms_text"
         private const val KEY_OWN_PHONE_NUMBER = "own_phone_number"
@@ -2304,9 +2251,12 @@ class SharedPreferencesManager(private val context: Context) {
         private const val DEFAULT_SMTP_PORT = 587
         private const val PREFS_NAME = "SMSForwarderEncryptedPrefs"
         private const val PREFS_NAME_FALLBACK = "SMSForwarderPrefs"
-
-        // Schlüssel für Weiterleitungsstatus
-        private const val KEY_FORWARDING_ACTIVE = "forwarding_active"
+        private const val DEFAULT_TEST_SMS_TEXT = "Das ist eine Test-SMS"
+        private const val DEFAULT_TEST_EMAIL_TEXT = "Das ist eine Test-Email"
+         private const val DEFAULT_FILTER_TEXT = ""
+        private const val DEFAULT_OWN_PHONE = ""
+        private const val DEFAULT_COUNTRY_CODE = "+43"
+         private const val KEY_FORWARDING_ACTIVE = "forwarding_active"
         private const val KEY_SELECTED_PHONE = "selected_phone_number"
         private const val KEY_KEEP_FORWARDING_ON_EXIT = "keep_forwarding_on_exit"
     }
@@ -2315,599 +2265,94 @@ class SharedPreferencesManager(private val context: Context) {
 class PreferencesInitializationException(message: String, cause: Throwable? = null) :
     Exception(message, cause)
 
-class PermissionHandler(private val activity: Activity) {
+class PermissionHandler(private val activity: MainActivity) {
 
-    // Erforderliche Berechtigungen für die App
-    private val requiredPermissions = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-        arrayOf(
-            android.Manifest.permission.READ_CONTACTS,
-            android.Manifest.permission.RECEIVE_SMS,
-            android.Manifest.permission.SEND_SMS,
-            android.Manifest.permission.CALL_PHONE,
-            android.Manifest.permission.READ_PHONE_STATE,
-            android.Manifest.permission.READ_PHONE_NUMBERS,
-            android.Manifest.permission.POST_NOTIFICATIONS  // Neue Berechtigung für Benachrichtigungen
-        )
-    } else {
-        arrayOf(
-            android.Manifest.permission.READ_CONTACTS,
-            android.Manifest.permission.RECEIVE_SMS,
-            android.Manifest.permission.SEND_SMS,
-            android.Manifest.permission.CALL_PHONE,
-            android.Manifest.permission.READ_PHONE_STATE,
-            android.Manifest.permission.READ_PHONE_NUMBERS
-        )
-    }
-    //private lateinit var permissionHandler: PermissionHandler
+    private val requiredPermissions: Array<String> = getRequiredPermissions()
 
-    private lateinit var requestPermissionLauncher: ActivityResultLauncher<Array<String>>
-    private var isBatteryOptimizationRequested = false
-    private var onPermissionsResult: ((Boolean) -> Unit)? = null
-
-    fun initialize(launcher: ActivityResultLauncher<Array<String>>) {
-        requestPermissionLauncher = launcher
+    private val requestLauncher = activity.registerForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { permissions ->
+        val allGranted = permissions.all { it.value }
+        permissionCallback?.invoke(allGranted)
+        permissionCallback = null
     }
 
-    fun checkAndRequestPermissions(onResult: (Boolean) -> Unit) {
-        onPermissionsResult = onResult
+    private var permissionCallback: ((Boolean) -> Unit)? = null
 
-        // Zuerst prüfen wir die normalen Berechtigungen
-        if (allPermissionsGranted()) {
-            requestBatteryOptimization()
-            onResult(true)
+    fun checkPermissions(
+        onGranted: () -> Unit,
+        onDenied: () -> Unit
+    ) {
+        if (hasPermissions()) {
+            onGranted()
         } else {
-            LoggingManager.logInfo(
-                component = "PermissionHandler",
-                action = "REQUEST_PERMISSIONS",
-                message = "Fordere fehlende Berechtigungen an",
-                details = mapOf(
-                    "missing_permissions" to getMissingPermissions().joinToString()
-                )
-            )
+            permissionCallback = { granted ->
+                if (granted) onGranted() else onDenied()
+            }
             requestPermissions()
         }
     }
 
-    private fun getMissingPermissions(): List<String> {
-        return requiredPermissions.filter {
-            ContextCompat.checkSelfPermission(activity, it) != PackageManager.PERMISSION_GRANTED
+    private fun hasPermissions(): Boolean {
+        return requiredPermissions.all { permission ->
+            ContextCompat.checkSelfPermission(activity, permission) == PackageManager.PERMISSION_GRANTED
         }
-    }
-
-    private fun allPermissionsGranted() = requiredPermissions.all {
-        ContextCompat.checkSelfPermission(activity, it) == PackageManager.PERMISSION_GRANTED
     }
 
     private fun requestPermissions() {
-        requestPermissionLauncher.launch(requiredPermissions)
+        try {
+            requestLauncher.launch(requiredPermissions)
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to request permissions", e)
+            permissionCallback?.invoke(false) // Falls etwas schiefgeht, verweigere Zugriff
+        }
     }
 
-    @SuppressLint("BatteryLife")
-    private fun requestBatteryOptimization() {
-        if (!isBatteryOptimizationRequested) {
-            val packageName = activity.packageName
-            val pm = activity.getSystemService(Context.POWER_SERVICE) as PowerManager
-            if (!pm.isIgnoringBatteryOptimizations(packageName)) {
-                try {
-                    val intent = Intent().apply {
-                        action = Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS
-                        data = Uri.parse("package:$packageName")
-                    }
-                    isBatteryOptimizationRequested = true
-                    activity.startActivity(intent)
-
-                    LoggingManager.logInfo(
-                        component = "PermissionHandler",
-                        action = "BATTERY_OPTIMIZATION",
-                        message = "Batterie-Optimierung-Dialog angezeigt"
-                    )
-                } catch (e: Exception) {
-                    LoggingManager.logError(
-                        component = "PermissionHandler",
-                        action = "BATTERY_OPTIMIZATION_ERROR",
-                        message = "Fehler beim Anzeigen des Batterie-Optimierung-Dialogs",
-                        error = e
-                    )
-                }
-            }
+    private fun getRequiredPermissions(): Array<String> {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            PERMISSIONS_TIRAMISU
+        } else {
+            PERMISSIONS_BASE
         }
+    }
+
+    companion object {
+        private const val TAG = "PermissionHandler"
+
+        private val PERMISSIONS_BASE = arrayOf(
+            Manifest.permission.READ_CONTACTS,
+            Manifest.permission.SEND_SMS,
+            Manifest.permission.RECEIVE_SMS,
+            Manifest.permission.CALL_PHONE,
+            Manifest.permission.READ_PHONE_STATE,
+            Manifest.permission.READ_PHONE_NUMBERS
+        )
+
+        @SuppressLint("InlinedApi")
+        private val PERMISSIONS_TIRAMISU = PERMISSIONS_BASE + arrayOf(
+            Manifest.permission.POST_NOTIFICATIONS
+        )
     }
 }
 
 class Logger(
     context: Context,
-    private val maxEntries: Int = 1000,
-    private val rotationSize: Int = 750,  // Neue Variable für Rotationsgröße
-    private val maxFileSize: Long = 5 * 1024 * 1024  // Max 5MB pro Log-Datei
-) {
-    companion object {
-        private const val TAG = "SmsLogger"  // Maximal 23 Zeichen für Android-Logging
-    }
-
-    private val logMutex = Mutex()  // Mutex für thread-sichere Operationen
-    private val filePattern = "app_log_%d.xml"
-    private val maxLogFiles = 5  // Maximale Anzahl von Log-Dateien
-    private val baseLogDir: File =
-        context.getExternalFilesDir("logs") ?: context.getExternalFilesDir(null)!!
-    private val mainLogFile: File = File(baseLogDir, "app_log.xml")
-
-    private val logFile: File = File(context.getExternalFilesDir(null), "app_log.xml")
-    private val dateFormat = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault())
-    private val documentBuilder = DocumentBuilderFactory.newInstance().newDocumentBuilder()
-    private val transformer = TransformerFactory.newInstance().newTransformer().apply {
-        setOutputProperty(OutputKeys.INDENT, "yes")
-    }
-
-    private val logBuffer = mutableListOf<LogEntry>()
-    private var lastSaveTime = System.currentTimeMillis()
-    private val saveInterval = 60000 // 1 minute in milliseconds
-
+    private val maxFileSize: Long = 5 * 1024 * 1024 // 5MB
+)
+{
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
-
-    private var lastError: LoggerException? = null
-
+    private val logMutex = Mutex()
+    private val baseLogDir: File = context.getExternalFilesDir("logs") ?: context.getExternalFilesDir(null)!!
+    private val mainLogFile = File(baseLogDir, "app_log.xml")
+    private val backupFile = File(baseLogDir, "app_log_backup.xml")
+    private val dateFormat = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss", Locale.getDefault())
+    private var logEntryCounter = 0
     init {
-        baseLogDir.mkdirs()
-        startPeriodicCleanup()
-
-        scope.launch {
-            try {
-                LoggingManager.logInfo(
-                    component = "Logger",
-                    action = "INIT_START",
-                    message = "Logger-Initialisierung gestartet"
-                )
-
-                cleanupOldLogFiles()
-                if (!mainLogFile.exists() || !loadExistingLogs()) {
-                    createNewLogFile()
-                }
-
-                LoggingManager.logInfo(
-                    component = "Logger",
-                    action = "INIT_COMPLETE",
-                    message = "Logger-Initialisierung abgeschlossen"
-                )
-            } catch (e: Exception) {
-                handleException(e, "Initialization failed")
-                createNewLogFile()
-            }
+        require(baseLogDir.exists() || baseLogDir.mkdirs()) { "Log directory could not be created: $baseLogDir" }
+        if (!mainLogFile.exists()) {
+            createEmptyLogFile()
         }
-    }
-
-    private fun startPeriodicCleanup() {
-        scope.launch {
-            while (true) {
-                delay(30 * 60 * 1000) // Alle 30 Minuten
-                try {
-                    performMaintenance()
-                } catch (e: Exception) {
-                    handleException(e, "Periodic cleanup failed")
-                }
-            }
-        }
-    }
-
-    private suspend fun performMaintenance() {
-        logMutex.withLock {
-            try {
-                rotateLogsIfNeeded()
-                cleanupOldLogFiles()
-                trimLogBuffer()
-            } catch (e: Exception) {
-                handleException(e, "Maintenance failed")
-            }
-        }
-    }
-
-    private fun rotateLogsIfNeeded() {
-        if (mainLogFile.length() > maxFileSize) {
-            val timestamp = System.currentTimeMillis()
-            val rotatedFile = File(
-                baseLogDir,
-                String.format(Locale.US, filePattern, timestamp)
-            )
-
-            try {
-                mainLogFile.renameTo(rotatedFile)
-                createNewLogFile()
-
-                LoggingManager.logInfo(
-                    component = "Logger",
-                    action = "LOG_ROTATION",
-                    message = "Log-Datei rotiert",
-                    details = mapOf(
-                        "old_size" to mainLogFile.length(),
-                        "new_file" to rotatedFile.name
-                    )
-                )
-            } catch (e: Exception) {
-                handleException(e, "Log rotation failed")
-            }
-        }
-    }
-
-    private fun cleanupOldLogFiles() {
-        try {
-            val logFiles = baseLogDir.listFiles { file ->
-                file.name.matches(Regex("app_log_\\d+\\.xml"))
-            }?.sortedByDescending { it.lastModified() }
-
-            logFiles?.drop(maxLogFiles)?.forEach { file ->
-                file.delete()
-                LoggingManager.logInfo(
-                    component = "Logger",
-                    action = "CLEANUP",
-                    message = "Alte Log-Datei gelöscht",
-                    details = mapOf("file" to file.name)
-                )
-            }
-        } catch (e: Exception) {
-            handleException(e, "Cleanup of old log files failed")
-        }
-    }
-
-    private fun trimLogBuffer() {
-        if (logBuffer.size > maxEntries) {
-            val trimCount = logBuffer.size - rotationSize
-            if (trimCount > 0) {
-                try {
-                    // Sichere zuerst die zu entfernenden Einträge
-                    val entriesToSave = logBuffer.take(trimCount)
-                    appendToArchiveFile(entriesToSave)
-
-                    // Dann entferne sie aus dem Buffer
-                    logBuffer.subList(0, trimCount).clear()
-
-                    LoggingManager.logInfo(
-                        component = "Logger",
-                        action = "BUFFER_TRIM",
-                        message = "Log-Buffer gekürzt",
-                        details = mapOf(
-                            "removed_entries" to trimCount,
-                            "current_size" to logBuffer.size
-                        )
-                    )
-                } catch (e: Exception) {
-                    handleException(e, "Buffer trimming failed")
-                }
-            }
-        }
-    }
-
-    private fun appendToArchiveFile(entries: List<LogEntry>) {
-        val archiveFile = File(baseLogDir, "archive_${getCurrentTimestamp().replace(":", "-")}.xml")
-        try {
-            val doc = documentBuilder.newDocument()
-            val rootElement = doc.createElement("logEntries")
-            doc.appendChild(rootElement)
-
-            entries.forEach { (time, text) ->
-                val logEntryElement = doc.createElement("logEntry")
-                logEntryElement.appendChild(createElementWithText(doc, "time", time))
-                logEntryElement.appendChild(createElementWithText(doc, "text", text))
-                rootElement.appendChild(logEntryElement)
-            }
-
-            FileOutputStream(archiveFile).use { fos ->
-                transformer.transform(DOMSource(doc), StreamResult(fos))
-            }
-        } catch (e: Exception) {
-            handleException(e, "Failed to archive log entries")
-        }
-    }
-
-    // Überschreibe die bestehende addLogEntry Funktion
-    fun addLogEntry(entry: String) {
-        scope.launch {
-            logMutex.withLock {
-                try {
-                    val timestamp = getCurrentTimestamp()
-                    logBuffer.add(LogEntry(timestamp, entry))
-
-                    if (System.currentTimeMillis() - lastSaveTime > saveInterval) {
-                        saveLogsToFile()
-                        performMaintenance()
-                    }
-                } catch (e: Exception) {
-                    handleException(e, "Failed to add log entry")
-                }
-            }
-        }
-    }
-
-    // Modifiziere die bestehende saveLogsToFile Funktion
-    private suspend fun saveLogsToFile() {
-        logMutex.withLock {
-            try {
-                val doc = documentBuilder.newDocument()
-                val rootElement = doc.createElement("logEntries")
-                doc.appendChild(rootElement)
-
-                logBuffer.forEach { (time, text) ->
-                    val logEntryElement = doc.createElement("logEntry")
-                    logEntryElement.appendChild(createElementWithText(doc, "time", time))
-                    logEntryElement.appendChild(createElementWithText(doc, "text", text))
-                    rootElement.appendChild(logEntryElement)
-                }
-
-                saveDocumentToFile(doc)
-                lastSaveTime = System.currentTimeMillis()
-            } catch (e: Exception) {
-                handleException(e, "Failed to save logs to file")
-            }
-        }
-    }
-
-
-    private fun loadExistingLogs(): Boolean {
-        return try {
-            val doc = documentBuilder.parse(logFile)
-            val entries = doc.documentElement.getElementsByTagName("logEntry")
-            logBuffer.clear() // Clear existing buffer before loading
-            for (i in 0 until entries.length) {
-                val entry = entries.item(i) as Element
-                val time = entry.getElementsByTagName("time").item(0).textContent
-                val text = entry.getElementsByTagName("text").item(0).textContent
-                logBuffer.add(LogEntry(time, text))
-            }
-            true // Successfully loaded
-        } catch (e: Exception) {
-            handleException(e, "Failed to load existing logs, creating new file")
-            false // Failed to load
-        }
-    }
-
-    private fun createNewLogFile() {
-        try {
-            scope.launch {
-                logBuffer.clear()
-                val doc = documentBuilder.newDocument()
-                doc.appendChild(doc.createElement("logEntries"))
-                saveDocumentToFile(doc)
-
-                // Erstelle einen aussagekräftigen Initialisierungs-Log-Eintrag
-                //val timestamp = dateFormat.format(Date())
-                val initMessage = buildString {
-                    append("Neue Log-Datei erstellt: ")
-                    append(logFile.absolutePath)
-                    append(" (Grund: ")
-                    append(
-                        if (logFile.exists()) "Fehler beim Laden der existierenden Datei"
-                        else "Datei existierte nicht"
-                    )
-                    append(")")
-                }
-
-                addLogEntry(initMessage)
-            }
-
-        } catch (e: Exception) {
-            val errorMsg = buildString {
-                append("Kritischer Fehler beim Erstellen der Log-Datei: ")
-                append(e.message)
-                append(" (")
-                append(e.javaClass.simpleName)
-                append(")")
-                if (logFile.exists()) {
-                    append(" - Datei existiert bereits: ")
-                    append(logFile.absolutePath)
-                }
-            }
-
-            Log.e(TAG, errorMsg, e)
-            handleException(e, "Failed to create new log file")
-        }
-    }
-
-    fun clearLog() {
-        try {
-            logBuffer.clear()
-
-            createNewLogFile()
-
-            LoggingManager.logInfo(
-                component = "Logger",
-                action = "CLEAR_LOG",
-                message = "Log wurde gelöscht"
-            )
-        } catch (e: Exception) {
-            handleException(e, "Failed to clear log")
-        }
-    }
-
-    fun getLogEntries(): String = try {
-        buildString {
-            logBuffer.forEach { (time, text) ->
-                append("$time - $text\n")
-            }
-        }
-    } catch (e: Exception) {
-        handleException(e, "Failed to get log entries")
-        "Error: Unable to retrieve log entries"
-    }
-
-    fun getLogEntriesHtml(): String = buildString {
-        append(
-            """
-    <!DOCTYPE html>
-    <html lang="de">
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-        <title>Log-Einträge</title>
-        <style>
-            body {
-                font-family: Arial, sans-serif;
-                font-size: 16px;
-                line-height: 1.6;
-                margin: 0;
-                padding: 0;
-                background-color: #f0f0f0;
-            }
-            .container {
-                width: 100%;
-                background-color: white;
-                box-shadow: 0 0 10px rgba(0,0,0,0.1);
-            }
-            table {
-                width: 100%;
-                table-layout: fixed;
-                border-collapse: collapse;
-                margin-bottom: 20px;
-            }
-            th, td {
-                padding: 12px;
-                text-align: left;
-                border-bottom: 1px solid #ddd;
-                font-size: 12px;
-                overflow-wrap: break-word;
-                word-wrap: break-word;
-            }
-            th {
-                background-color: #4CAF50;
-                color: white;
-                font-weight: bold;
-                position: sticky;
-                top: 0;
-            }
-            tr:nth-child(even) {
-                background-color: #f2f2f2;
-            }
-            tr:hover {
-                background-color: #ddd;
-            }
-            .time-column {
-                white-space: nowrap;
-                width: 100px;
-            }
-            .entry-column {
-                width: calc(100% - 100px);
-            }
-            .time-cell {
-                display: flex;
-                flex-direction: column;
-                gap: 2px;
-            }
-            .date {
-                font-weight: bold;
-            }
-            .time {
-                color: #666;
-            }
-            .sms-forward {
-                color: #8B0000;
-                font-weight: 500;
-            }
-            @media screen and (max-width: 600px) {
-                th, td {
-                    padding: 8px;
-                    font-size: 10px;
-                }
-                .time-column {
-                    width: 80px;
-                }
-                .entry-column {
-                    width: calc(100% - 80px);
-                }
-            }
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <table>
-                <thead>
-                    <tr>
-                        <th class="time-column">Zeitpunkt</th>
-                        <th class="entry-column">Eintrag</th>
-                    </tr>
-                </thead>
-                <tbody>
-    """.trimIndent()
-        )
-
-        logBuffer.asReversed().forEach { (timeStamp, text) ->
-            val parts = timeStamp.split(" ")
-            val isSmsForward = text.contains("Weiterleitung") || text.contains("] SEND_SMS")
-
-            val entryClass = if (isSmsForward) "entry-column sms-forward" else "entry-column"
-
-            if (parts.size == 2) {
-                val (date, time) = parts
-                append(
-                    """
-                <tr>
-                    <td class="time-column">
-                        <div class="time-cell">
-                            <span class="date">$date</span>
-                            <span class="time">$time</span>
-                        </div>
-                    </td>
-                    <td class="$entryClass">$text</td>
-                </tr>
-            """
-                )
-            } else {
-                append(
-                    """
-                <tr>
-                    <td class="time-column">$timeStamp</td>
-                    <td class="$entryClass">$text</td>
-                </tr>
-            """
-                )
-            }
-        }
-
-        append(
-            """
-                </tbody>
-            </table>
-        </div>
-    </body>
-    </html>
-    """.trimIndent()
-        )
-    }
-
-    private fun saveDocumentToFile(doc: Document) {
-        try {
-            FileOutputStream(logFile).use { fos ->
-                transformer.transform(DOMSource(doc), StreamResult(fos))
-            }
-        } catch (e: Exception) {
-            handleException(e, "Failed to save document to file")
-        }
-    }
-
-    private fun createElementWithText(
-        doc: Document,
-        tagName: String,
-        textContent: String
-    ): Element {
-        return doc.createElement(tagName).apply {
-            appendChild(doc.createTextNode(textContent))
-        }
-    }
-
-    private fun getCurrentTimestamp(): String = dateFormat.format(Date())
-
-    private data class LogEntry(val time: String, val text: String)
-
-
-    private fun handleException(e: Exception, message: String) {
-        val loggerException = LoggerException(message, e)
-        lastError = loggerException
-        Log.e("Logger", message, e)
-        Log.w("Logger", "Logger Error: $message - ${e.message}")
-    }
-
-    class LoggerException(message: String, cause: Throwable?) : Exception(message, cause)
-}
-
-class LoggingHelper(private val logger: Logger) {
-    companion object {
-        private const val TAG = "AppLogger"
+        addInitialLogEntry()
     }
 
     enum class LogLevel {
@@ -2926,17 +2371,14 @@ class LoggingHelper(private val logger: Logger) {
         message: String,
         exception: Throwable? = null
     ) {
-        val formattedMessage = buildLogMessage(metadata, message)
-
-        // Log ins System-Log
+        val logMessage = buildLogMessage(metadata, message)
         when (level) {
-            LogLevel.INFO -> Log.i(TAG, formattedMessage)
-            LogLevel.WARNING -> Log.w(TAG, formattedMessage)
-            LogLevel.ERROR -> Log.e(TAG, formattedMessage, exception)
-            LogLevel.DEBUG -> Log.d(TAG, formattedMessage)
+            LogLevel.INFO -> Log.i(TAG, logMessage)
+            LogLevel.WARNING -> Log.w(TAG, logMessage)
+            LogLevel.ERROR -> Log.e(TAG, logMessage, exception)
+            LogLevel.DEBUG -> Log.d(TAG, logMessage)
         }
 
-        // Log in die App
         val prefix = when (level) {
             LogLevel.INFO -> "ℹ️"
             LogLevel.WARNING -> "⚠️"
@@ -2947,13 +2389,15 @@ class LoggingHelper(private val logger: Logger) {
         val logEntry = buildString {
             append(prefix)
             append(" ")
-            append(formattedMessage)
+            append(logMessage)
             if (exception != null) {
                 append(" | Exception: ${exception.message}")
             }
         }
 
-        logger.addLogEntry(logEntry)
+        scope.launch {
+            writeLogToFile(getCurrentTimestamp(), logEntry)
+        }
     }
 
     private fun buildLogMessage(metadata: LogMetadata, message: String): String {
@@ -2968,4 +2412,285 @@ class LoggingHelper(private val logger: Logger) {
             append(message)
         }
     }
+
+    private suspend fun writeLogToFile(timestamp: String, entry: String) {
+        logMutex.withLock {
+            try {
+                if (mainLogFile.length() > maxFileSize) {
+                    rotateLogFiles()
+                }
+                appendToLogFile(timestamp, entry)
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to write log", e)
+            }
+        }
+    }
+
+    private fun appendToLogFile(timestamp: String, entry: String) {
+        try {
+            val document = DocumentBuilderFactory.newInstance()
+                .newDocumentBuilder()
+                .parse(mainLogFile)
+
+            val root = document.documentElement
+            val newEntry = document.createElement("logEntry").apply {
+                appendChild(document.createElement("time").apply { textContent = timestamp })
+                appendChild(document.createElement("text").apply { textContent = entry })
+            }
+            root.appendChild(newEntry)
+
+            TransformerFactory.newInstance().newTransformer().transform(
+                DOMSource(document),
+                StreamResult(mainLogFile)
+            )
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to append log entry", e)
+        }
+    }
+
+    private fun rotateLogFiles() {
+        backupFile.delete()
+        mainLogFile.renameTo(backupFile)
+        createEmptyLogFile()
+    }
+
+    private fun createEmptyLogFile() {
+        try {
+            mainLogFile.writeText(
+                """<?xml version="1.0" encoding="UTF-8"?>
+                   <logEntries>
+                   </logEntries>
+                """.trimIndent()
+            )
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to create empty log file", e)
+        }
+    }
+
+    private fun addInitialLogEntry() {
+        val initMessage = buildString {
+            append("Logger initialized. ")
+            append("Device: ${Build.MANUFACTURER} ${Build.MODEL}, ")
+            append("Android: ${Build.VERSION.RELEASE} ")
+            append("(API ${Build.VERSION.SDK_INT})")
+        }
+        log(LogLevel.INFO, LogMetadata("Logger", "INIT"), initMessage)
+    }
+
+    fun getLogEntries(): String = readLogEntries { entry ->
+        val time = entry.getElementsByTagName("time").item(0).textContent
+        val text = entry.getElementsByTagName("text").item(0).textContent
+
+        // Prüfe ob einer der Patterns im Text vorkommt
+        val shouldHighlight = highlightPatterns.any { pattern ->
+            text.contains(pattern, ignoreCase = true)
+        }
+
+        // Füge einen Farbcode für roten Text hinzu wenn nötig
+        val textWithColor = if (shouldHighlight) {
+            "\u001B[31m$text\u001B[0m"  // Rot für hervorgehobenen Text
+        } else {
+            text
+        }
+
+        "$time - $textWithColor\n"
+    }
+
+    private fun readLogEntries(process: (Element) -> String): String {
+        return try {
+            val document = DocumentBuilderFactory.newInstance()
+                .newDocumentBuilder()
+                .parse(mainLogFile)
+            val entries = document.getElementsByTagName("logEntry")
+            buildString {
+                for (i in entries.length - 1 downTo 0) {
+                    val entry = entries.item(i) as Element
+                    append(process(entry))
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to read log entries", e)
+            ""
+        }
+    }
+
+    private val highlightPatterns = listOf(
+        "ACTIVATE_FORWARDING",
+        "EXCEPTION",
+        "FAILURE",
+        "CRITICAL",
+        "SMS_FORWARD_FAILED",
+        "EMAIL_FORWARD_ERROR",
+        "PERMISSION_DENIED",
+        "WAKE_LOCK_ERROR",
+        "CONNECTION_FAILED",
+        "INVALID_NUMBER",
+        "SECURITY_ERROR",
+        "AUTHENTICATION_FAILED"
+    )
+
+    private fun readLogEntries(process: (Element, Boolean) -> String): String {
+        return try {
+            val document = DocumentBuilderFactory.newInstance()
+                .newDocumentBuilder()
+                .parse(mainLogFile)
+            val entries = document.getElementsByTagName("logEntry")
+            buildString {
+                for (i in entries.length - 1 downTo 0) {
+                    val entry = entries.item(i) as Element
+                    val entryText = entry.getElementsByTagName("text").item(0).textContent
+
+                    // Prüfe, ob einer der Patterns im Text vorkommt
+                    val shouldHighlight = highlightPatterns.any { pattern ->
+                        entryText.contains(pattern, ignoreCase = true)
+                    }
+
+                    append(process(entry, shouldHighlight))
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to read log entries", e)
+            ""
+        }
+    }
+
+    fun getLogEntriesHtml(): String = buildString {
+        append(HTML_HEADER)
+        append(readLogEntries { entry, shouldHighlight ->
+            val timestamp = entry.getElementsByTagName("time").item(0).textContent
+            val text = entry.getElementsByTagName("text").item(0).textContent
+
+            val (date, time) = timestamp.split(" ", limit = 2)
+            val textClass = if (shouldHighlight) "text-red-600" else ""
+
+            """
+        <tr>
+            <td class="time-column">
+                <div class="time-cell">
+                    <span class="date">$date</span>
+                    <span class="time">$time</span>
+                </div>
+            </td>
+            <td class="entry-column $textClass">$text</td>
+        </tr>
+        """.trimIndent()
+        })
+        append(HTML_FOOTER)
+    }
+
+    fun getLogEntriesAsCsv(): String = buildString {
+        append("Datum;Zeit;Klasse;Eintrag\n") // CSV-Header mit Semikolon als Trennzeichen
+        append(readLogEntries { entry ->
+            val timestamp = entry.getElementsByTagName("time").item(0).textContent
+            val text = entry.getElementsByTagName("text").item(0).textContent
+            val (date, time) = timestamp.split(" ", limit = 2)
+            val replacedText = replaceSpecialCharacters(text)
+            val formattedText = replacedText.substringAfter("[", text)
+            "$date;$time;$formattedText\n" // Einträge durch Semikolon getrennt
+        })
+    }
+
+    // Hilfsfunktion zum Ersetzen von Umlauten und ß
+    private fun replaceSpecialCharacters(text: String): String {
+        return text
+            .replace("ä", "ae")
+            .replace("ö", "oe")
+            .replace("ü", "ue")
+            .replace("Ä", "Ae")
+            .replace("Ö", "Oe")
+            .replace("Ü", "Ue")
+            .replace("ß", "ss")
+            .replace(";", " ")  // Semikolon durch Leerzeichen ersetzen
+            .replace("\n", " ")  // Zeilenumbruch durch Leerzeichen ersetzen
+            .replace("\r", " ")  // Wagenrücklauf durch Leerzeichen ersetzen
+            .replaceFirst("]", ";")
+    }
+
+    fun clearLog() {
+        createEmptyLogFile()
+        addInitialLogEntry()
+    }
+
+    private fun getCurrentTimestamp(): String = LocalDateTime.now().format(dateFormat)
+
+    companion object {
+        private const val TAG = "Logger"
+        private val HTML_HEADER = """
+    <!DOCTYPE html>
+    <html lang="de">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <style>
+            body { 
+                font-family: 'Courier New', Courier, monospace; /* Monospaced font */
+                font-size: 12px; /* Kleinere Schriftgröße */
+                margin: 0; 
+                padding: 16px; 
+                background: #f5f5f5; 
+            }
+            table { 
+                width: 100%; 
+                border-collapse: collapse; 
+                background: white; 
+                box-shadow: 0 1px 3px rgba(0,0,0,0.1); 
+            }
+            th { 
+                background: #4CAF50; 
+                color: white; 
+                padding: 8px; 
+                text-align: left; 
+                font-size: 14px; 
+            }
+            td { 
+                padding: 8px; 
+                border-bottom: 1px solid #eee; 
+            }
+            .time-column { 
+                width: 140px; 
+                white-space: nowrap; 
+            }
+            .time-cell { 
+                display: flex; 
+                flex-direction: column; 
+                font-family: 'Courier New', Courier, monospace; /* Monospaced font for timestamp */
+            }
+            .date { 
+                font-weight: bold; 
+            }
+            .time { 
+                color: #666; 
+                font-size: 0.9em; 
+            }
+            .entry-column { 
+                font-family: 'Courier New', Courier, monospace; /* Monospaced font for entries */
+                font-size: 12px; /* Same smaller font size */
+            }
+            tr:hover { 
+                background: #f8f8f8; 
+            }
+            .text-red-600 {
+                color: #DC2626 !important;
+            }
+        </style>
+    </head>
+    <body>
+        <table>
+            <thead>
+                <tr>
+                    <th class="time-column">Zeitpunkt</th>
+                    <th class="entry-column">Eintrag</th>
+                </tr>
+            </thead>
+            <tbody>
+""".trimIndent()
+        private const val HTML_FOOTER = """
+            </tbody>
+        </table>
+    </body>
+    </html>
+"""
+
+    }
 }
+
