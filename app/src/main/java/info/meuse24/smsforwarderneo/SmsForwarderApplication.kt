@@ -1,8 +1,13 @@
 package info.meuse24.smsforwarderneo
 
+import android.annotation.SuppressLint
 import android.app.Application
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
 import android.content.ComponentCallbacks2
 import android.content.Context
+import android.os.Build
 import android.util.Log
 import androidx.compose.material3.SnackbarDuration
 import androidx.compose.material3.SnackbarHostState
@@ -78,10 +83,48 @@ class SmsForwarderApplication : Application() {
     override fun onCreate() {
         super.onCreate()
         instance = this
-
+        createNotificationChannel()
         // Nur Basis-Initialisierung
         initializeCriticalComponents()
         initializeBaseComponents()  // Add this call
+    }
+
+    @SuppressLint("ObsoleteSdkInt")
+    private fun createNotificationChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val notificationManager = getSystemService(NotificationManager::class.java)
+
+            // Existenzprüfung vor try-catch Block
+            val existingChannel = notificationManager?.getNotificationChannel("MY_CHANNEL_ID")
+            if (existingChannel != null) {
+                return
+            }
+
+            try {
+                val channel = NotificationChannel(
+                    "MY_CHANNEL_ID",
+                    "SMS Weiterleitung",
+                    NotificationManager.IMPORTANCE_LOW
+                ).apply {
+                    description = "Zeigt den Status der SMS/Anruf-Weiterleitung an"
+                    setShowBadge(true)
+                    enableLights(false)
+                    enableVibration(false)
+                    vibrationPattern = null
+                    lockscreenVisibility = Notification.VISIBILITY_PUBLIC
+                }
+
+                notificationManager?.createNotificationChannel(channel)
+
+            } catch (e: Exception) {
+                LoggingManager.logError(
+                    component = "SmsForwarderApplication",
+                    action = "CREATE_NOTIFICATION_CHANNEL",
+                    message = "Fehler beim Erstellen des Notification Channels",
+                    error = e
+                )
+            }
+        }
     }
 
     private fun initializeCriticalComponents() {

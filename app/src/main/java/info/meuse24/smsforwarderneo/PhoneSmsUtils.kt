@@ -29,6 +29,7 @@ import javax.mail.internet.MimeMessage
  * PhoneSmsUtils ist eine Utility-Klasse für SMS- und Telefonie-bezogene Funktionen.
  * Sie bietet Methoden zum Senden von SMS, USSD-Codes und zum Abrufen von SIM-Karteninformationen.
  */
+@Suppress("DEPRECATION")
 class PhoneSmsUtils private constructor() {
 
     /**
@@ -445,7 +446,7 @@ class PhoneSmsUtils private constructor() {
             }
         }
 
-        @SuppressLint("MissingPermission", "HardwareIds")
+        @SuppressLint("MissingPermission", "HardwareIds", "ObsoleteSdkInt")
         fun getSimCardNumber(context: Context): String {
             // Prüfe Berechtigungen
             val requiredPermissions = arrayOf(

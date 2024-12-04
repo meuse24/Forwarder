@@ -661,8 +661,8 @@ class ContactsViewModel(
                             details = mapOf("error" to result.message)
                         )
                     }
-
-                    ForwardingResult.Success -> { /* bereits behandelt */
+                    ForwardingResult.Success -> {
+                        updateServiceNotification() // Hier hinzugefügt
                     }
                 }
             }
@@ -1133,6 +1133,7 @@ class ContactsViewModel(
                         }
                     }
                 }
+                updateServiceNotification()
                 return@launch
             }
 
@@ -1269,40 +1270,64 @@ class ContactsViewModel(
         }
     }
 
-    // Bei Änderungen am Email-Weiterleitungsstatus
     fun updateForwardSmsToEmail(enabled: Boolean) {
         _forwardSmsToEmail.value = enabled
         prefsManager.setForwardSmsToEmail(enabled)
         updateServiceNotification()
+
+        LoggingManager.logInfo(
+            component = "ContactsViewModel",
+            action = if (enabled) "ENABLE_EMAIL_FORWARDING" else "DISABLE_EMAIL_FORWARDING",
+            message = "Email-Weiterleitung ${if (enabled) "aktiviert" else "deaktiviert"}",
+            details = mapOf(
+                "sms_forwarding_active" to _forwardingActive.value,
+                "email_addresses_count" to _emailAddresses.value.size
+            )
+        )
     }
 
     private fun updateServiceNotification() {
-
         val status = buildString {
-            if (forwardingActive.value) {
-                append("SMS-Weiterleitung aktiv")
-                selectedContact.value?.let { contact ->
-                    append(" zu ${contact.name}")
+            val hasForwarding = _forwardingActive.value
+            val hasEmail = _forwardSmsToEmail.value
+
+            when {
+                // Beide aktiv
+                hasForwarding && hasEmail -> {
+                    append("SMS-Weiterleitung aktiv")
+                    _selectedContact.value?.let { contact ->
+                        append(" zu ${contact.name}")
+                    }
+                    append("\nEmail-Weiterleitung aktiv")
+                    val emailCount = _emailAddresses.value.size
+                    append(" an $emailCount Email(s)")
                 }
-            }
-            if (forwardSmsToEmail.value) {
-                if (forwardingActive.value) append("\n")
-                append("Email-Weiterleitung aktiv")
-                val emailCount = _emailAddresses.value.size
-                append(" an $emailCount Email(s)")
-            }
-            if (!forwardingActive.value && !forwardSmsToEmail.value) {
-                append("Keine Weiterleitung aktiv")
+                // Nur SMS-Weiterleitung
+                hasForwarding -> {
+                    append("SMS-Weiterleitung aktiv")
+                    _selectedContact.value?.let { contact ->
+                        append(" zu ${contact.name}")
+                    }
+                }
+                // Nur Email-Weiterleitung
+                hasEmail -> {
+                    append("Email-Weiterleitung aktiv")
+                    val emailCount = _emailAddresses.value.size
+                    append(" an $emailCount Email(s)")
+                }
+                // Keine Weiterleitung aktiv
+                else -> {
+                    append("TEL/SMS Forwarder läuft im Hintergrund.")
+                }
             }
         }
 
-            viewModelScope.launch {
-                val intent = Intent(AppContainer.getApplication(), SmsForegroundService::class.java)
-                intent.action = "UPDATE_NOTIFICATION"
-                intent.putExtra("contentText", status)
-                AppContainer.getApplication().startService(intent)
-            }
-
+        viewModelScope.launch {
+            val intent = Intent(AppContainer.getApplication(), SmsForegroundService::class.java)
+            intent.action = "UPDATE_NOTIFICATION"
+            intent.putExtra("contentText", status)
+            AppContainer.getApplication().startService(intent)
+        }
     }
 
     /**
@@ -1961,6 +1986,8 @@ class SharedPreferencesManager(private val context: Context) {
 
     // Deaktiviere Weiterleitung
     private fun deactivateForwarding() {
+
+
         prefs.edit().apply {
             putBoolean(KEY_FORWARDING_ACTIVE, false)
             putString(KEY_SELECTED_PHONE, "")
@@ -2412,21 +2439,21 @@ class Logger(
             append(message)
         }
     }
-
     private suspend fun writeLogToFile(timestamp: String, entry: String) {
         logMutex.withLock {
             try {
                 if (mainLogFile.length() > maxFileSize) {
                     rotateLogFiles()
                 }
-                appendToLogFile(timestamp, entry)
+                logEntryCounter++
+                appendToLogFile(timestamp, entry, logEntryCounter)
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to write log", e)
             }
         }
     }
 
-    private fun appendToLogFile(timestamp: String, entry: String) {
+    private fun appendToLogFile(timestamp: String, entry: String, entryNumber: Int) {
         try {
             val document = DocumentBuilderFactory.newInstance()
                 .newDocumentBuilder()
@@ -2434,6 +2461,7 @@ class Logger(
 
             val root = document.documentElement
             val newEntry = document.createElement("logEntry").apply {
+                appendChild(document.createElement("number").apply { textContent = entryNumber.toString() })
                 appendChild(document.createElement("time").apply { textContent = timestamp })
                 appendChild(document.createElement("text").apply { textContent = entry })
             }
@@ -2447,6 +2475,8 @@ class Logger(
             Log.e(TAG, "Failed to append log entry", e)
         }
     }
+
+
 
     private fun rotateLogFiles() {
         backupFile.delete()
@@ -2505,7 +2535,8 @@ class Logger(
             buildString {
                 for (i in entries.length - 1 downTo 0) {
                     val entry = entries.item(i) as Element
-                    append(process(entry))
+                    val number = entry.getElementsByTagName("number").item(0).textContent
+                    append("$number: ${process(entry)}")
                 }
             }
         } catch (e: Exception) {
@@ -2513,6 +2544,7 @@ class Logger(
             ""
         }
     }
+
 
     private val highlightPatterns = listOf(
         "ACTIVATE_FORWARDING",
@@ -2539,13 +2571,16 @@ class Logger(
                 for (i in entries.length - 1 downTo 0) {
                     val entry = entries.item(i) as Element
                     val entryText = entry.getElementsByTagName("text").item(0).textContent
+                    entry.getElementsByTagName("number").item(0)?.textContent?.toIntOrNull()
 
                     // Prüfe, ob einer der Patterns im Text vorkommt
                     val shouldHighlight = highlightPatterns.any { pattern ->
                         entryText.contains(pattern, ignoreCase = true)
                     }
 
-                    append(process(entry, shouldHighlight))
+                    // Füge die Nummer des Log-Eintrags hinzu, falls vorhanden
+                    val processedEntry = process(entry, shouldHighlight)
+                    append(processedEntry)
                 }
             }
         } catch (e: Exception) {
@@ -2559,14 +2594,19 @@ class Logger(
         append(readLogEntries { entry, shouldHighlight ->
             val timestamp = entry.getElementsByTagName("time").item(0).textContent
             val text = entry.getElementsByTagName("text").item(0).textContent
+            val number = entry.getElementsByTagName("number").item(0)?.textContent ?: "N/A"
 
-            val (date, time) = timestamp.split(" ", limit = 2)
+            // Timestamp umformatieren
+            val formattedTimestamp = LocalDateTime.parse(timestamp, DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"))
+            val date = formattedTimestamp.format(DateTimeFormatter.ofPattern("yyyyMMdd"))
+            val time = formattedTimestamp.format(DateTimeFormatter.ofPattern("HHmmss"))
             val textClass = if (shouldHighlight) "text-red-600" else ""
 
             """
         <tr>
             <td class="time-column">
                 <div class="time-cell">
+                <span class="date">#$number</span>
                     <span class="date">$date</span>
                     <span class="time">$time</span>
                 </div>
@@ -2579,14 +2619,16 @@ class Logger(
     }
 
     fun getLogEntriesAsCsv(): String = buildString {
-        append("Datum;Zeit;Klasse;Eintrag\n") // CSV-Header mit Semikolon als Trennzeichen
+        append("Nr;Datum;Zeit;Eintrag\n") // CSV-Header mit Nummer-Spalte
         append(readLogEntries { entry ->
             val timestamp = entry.getElementsByTagName("time").item(0).textContent
             val text = entry.getElementsByTagName("text").item(0).textContent
+            val number = entry.getElementsByTagName("number").item(0)?.textContent ?: "N/A"
+
             val (date, time) = timestamp.split(" ", limit = 2)
             val replacedText = replaceSpecialCharacters(text)
-            val formattedText = replacedText.substringAfter("[", text)
-            "$date;$time;$formattedText\n" // Einträge durch Semikolon getrennt
+
+            "$number;$date;$time;$replacedText\n" // Nummer hinzufügen
         })
     }
 
@@ -2646,6 +2688,12 @@ class Logger(
                 padding: 8px; 
                 border-bottom: 1px solid #eee; 
             }
+            .number-column {
+                width: 60px;
+                text-align: right;
+                font-weight: bold;
+            }
+
             .time-column { 
                 width: 140px; 
                 white-space: nowrap; 
@@ -2656,7 +2704,8 @@ class Logger(
                 font-family: 'Courier New', Courier, monospace; /* Monospaced font for timestamp */
             }
             .date { 
-                font-weight: bold; 
+                color: #666; 
+                font-size: 0.9em; 
             }
             .time { 
                 color: #666; 
@@ -2678,7 +2727,7 @@ class Logger(
         <table>
             <thead>
                 <tr>
-                    <th class="time-column">Zeitpunkt</th>
+                    <th class="time-column">Zeit</th>
                     <th class="entry-column">Eintrag</th>
                 </tr>
             </thead>
