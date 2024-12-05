@@ -24,6 +24,9 @@ import javax.mail.Session
 import javax.mail.Transport
 import javax.mail.internet.InternetAddress
 import javax.mail.internet.MimeMessage
+import android.net.ConnectivityManager
+import android.telephony.ServiceState
+import java.io.IOException
 
 /**
  * PhoneSmsUtils ist eine Utility-Klasse für SMS- und Telefonie-bezogene Funktionen.
@@ -98,6 +101,62 @@ class PhoneSmsUtils private constructor() {
                 action = "INITIALIZE",
                 message = "PhoneSmsUtils initialized"
             )
+        }
+
+        @SuppressLint("MissingPermission")
+        private fun checkNetworkStatus(context: Context): Pair<Boolean, String> {
+            try {
+                // Prüfe grundsätzliche Netzwerkkonnektivität
+                val connectivityManager = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+                val network = connectivityManager.activeNetwork
+                val capabilities = connectivityManager.getNetworkCapabilities(network)
+
+                if (capabilities == null) {
+                    return false to "Keine Netzwerkverbindung verfügbar"
+                }
+
+                // Prüfe Telefonie-Status
+                val telephonyManager = context.getSystemService(Context.TELEPHONY_SERVICE) as TelephonyManager
+                // Prüfe beide erforderlichen Berechtigungen
+                val hasPhoneStatePermission = context.checkSelfPermission(Manifest.permission.READ_PHONE_STATE) ==
+                        PackageManager.PERMISSION_GRANTED
+                val hasLocationPermission = context.checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) ==
+                        PackageManager.PERMISSION_GRANTED
+                // Prüfe Service State nur wenn beide Berechtigungen vorhanden
+                if (hasPhoneStatePermission && hasLocationPermission) {
+                    val serviceState = telephonyManager.serviceState
+                    if (serviceState?.state != ServiceState.STATE_IN_SERVICE) {
+                        return false to "Mobilfunkdienst nicht verfügbar"
+                    }
+                }
+
+                // Prüfe SIM-Status (benötigt keine zusätzliche Berechtigung)
+                when (telephonyManager.simState) {
+                    TelephonyManager.SIM_STATE_ABSENT -> return false to "Keine SIM-Karte gefunden"
+                    TelephonyManager.SIM_STATE_NETWORK_LOCKED,
+                    TelephonyManager.SIM_STATE_PIN_REQUIRED,
+                    TelephonyManager.SIM_STATE_PUK_REQUIRED -> return false to "SIM-Karte gesperrt"
+                    TelephonyManager.SIM_STATE_NOT_READY -> return false to "SIM-Karte nicht bereit"
+                    TelephonyManager.SIM_STATE_READY -> {
+                        LoggingManager.logInfo(
+                            component = "PhoneSmsUtils",
+                            action = "CHECK_NETWORK",
+                            message = "SIM und Netzwerk verfügbar"
+                        )
+                        return true to "Netzwerk verfügbar"
+                    }
+                    else -> return false to "SIM-Status unbekannt"
+                }
+
+            } catch (e: Exception) {
+                LoggingManager.logError(
+                    component = "PhoneSmsUtils",
+                    action = "CHECK_NETWORK",
+                    message = "Fehler bei der Netzwerkprüfung",
+                    error = e
+                )
+                return false to "Fehler bei der Netzwerkprüfung: ${e.message}"
+            }
         }
 
         /**
@@ -199,6 +258,26 @@ class PhoneSmsUtils private constructor() {
 
             if (phoneNumber.isBlank() || text.isBlank()) {
                 throw IllegalArgumentException("Phone number and text must not be empty")
+            }
+
+            // Netzwerk-Check vor dem Senden
+            val (isNetworkAvailable, networkStatus) = checkNetworkStatus(context)
+            if (!isNetworkAvailable) {
+                LoggingManager.logError(
+                    component = "PhoneSmsUtils",
+                    action = "SEND_SMS",
+                    message = "SMS konnte nicht gesendet werden: $networkStatus"
+                )
+                throw IOException("SMS-Versand nicht möglich: $networkStatus")
+            }
+
+            if (!checkPermission(context, Manifest.permission.SEND_SMS)) {
+                LoggingManager.logError(
+                    component = "PhoneSmsUtils",
+                    action = "SEND_SMS",
+                    message = "SMS permission not granted"
+                )
+                throw SecurityException("SMS permission not granted")
             }
 
             if (!checkPermission(context, Manifest.permission.SEND_SMS)) {
@@ -464,43 +543,41 @@ class PhoneSmsUtils private constructor() {
                 val telephonyManager = context.getSystemService(Context.TELEPHONY_SERVICE) as? TelephonyManager
                     ?: return ""
 
-                var phoneNumber = ""
-
                 // Strategie 1: Direct Line Number (API 29+)
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    phoneNumber = telephonyManager.line1Number.orEmpty()
-                    if (phoneNumber.isNotEmpty()) {
-                        logSuccess(phoneNumber, "line1Number")
-                        return formatPhoneNumber(phoneNumber)
+                    telephonyManager.line1Number?.let { number ->
+                        if (number.isNotEmpty()) {
+                            logSuccess(number, "line1Number")
+                            return formatPhoneNumber(number)
+                        }
                     }
                 }
 
                 // Strategie 2: Subscription Info (API 22+)
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP_MR1) {
                     val subscriptionManager = context.getSystemService(Context.TELEPHONY_SUBSCRIPTION_SERVICE) as? SubscriptionManager
-                    val number = subscriptionManager?.let { manager ->
-                        manager.activeSubscriptionInfoList?.firstNotNullOfOrNull {
-                            it.number?.takeIf { num -> num.isNotEmpty() }
-                        }
-                    }
-
-                    if (!number.isNullOrEmpty()) {
+                    subscriptionManager?.activeSubscriptionInfoList?.firstNotNullOfOrNull { subInfo ->
+                        subInfo.number?.takeIf { it.isNotEmpty() }
+                    }?.let { number ->
                         logSuccess(number, "subscription_info")
                         return formatPhoneNumber(number)
                     }
                 }
 
-                // Strategie 4: SIM Seriennummer (nur bei manchen Geräten verfügbar)
+                // Strategie 3: SIM Seriennummer (nur bei manchen Geräten verfügbar)
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                    val simSerialNumber = telephonyManager.simSerialNumber.orEmpty()
-                    if (simSerialNumber.matches(Regex("\\d+"))) {
-                        logSuccess(simSerialNumber, "sim_serial")
-                        return formatPhoneNumber(simSerialNumber)
+                    telephonyManager.simSerialNumber?.takeIf {
+                        it.isNotEmpty() && it.matches(Regex("\\d+"))
+                    }?.let { number ->
+                        logSuccess(number, "sim_serial")
+                        return formatPhoneNumber(number)
                     }
                 }
 
-                logWarning("Telefonnummer konnte nicht ermittelt werden",
-                    listOf("line1Number", "subscription_info", "msisdn", "sim_serial"))
+                logWarning(
+                    "Telefonnummer konnte nicht ermittelt werden",
+                    listOf("line1Number", "subscription_info", "sim_serial")
+                )
                 ""
 
             } catch (e: SecurityException) {

@@ -79,18 +79,20 @@ class ContactsViewModel(
     private val prefsManager: SharedPreferencesManager,
     private val logger: Logger
 ) : AndroidViewModel(application) {
+    private val contactsMutex = Mutex()
+    private val stateMutex = Mutex()
+    // StateFlows with thread-safe access
+    private val _contacts = MutableStateFlow<List<Contact>>(emptyList())
+    val contacts: StateFlow<List<Contact>> = _contacts.asStateFlow()
+
+    private val _selectedContact = MutableStateFlow<Contact?>(null)
+    val selectedContact: StateFlow<Contact?> = _selectedContact.asStateFlow()
 
     private val contactsStore = ContactsStore()
     private val _state = MutableStateFlow(ContactsState())
 
     // StateFlows für verschiedene UI-Zustände
-    private val _contacts = MutableStateFlow<List<Contact>>(emptyList())
-    val contacts: StateFlow<List<Contact>> = _contacts
-
     private val _isLoading = MutableStateFlow(false)
-
-    private val _selectedContact = MutableStateFlow<Contact?>(null)
-    val selectedContact: StateFlow<Contact?> = _selectedContact
 
     private val _forwardingActive = MutableStateFlow(false)
     val forwardingActive: StateFlow<Boolean> = _forwardingActive.asStateFlow()
@@ -196,6 +198,52 @@ class ContactsViewModel(
     enum class ForwardingAction {
         ACTIVATE, DEACTIVATE, TOGGLE
     }
+
+    suspend fun updateContacts(newContacts: List<Contact>) {
+        contactsMutex.withLock {
+            _contacts.value = newContacts
+        }
+    }
+    suspend fun selectContact(contact: Contact) {
+        stateMutex.withLock {
+            if (_selectedContact.value != contact) {
+                _selectedContact.value = contact
+                // Update other dependent state
+                _forwardingActive.value = true
+                _forwardingPhoneNumber.value = contact.phoneNumber
+                prefsManager.saveSelectedPhoneNumber(contact.phoneNumber)
+            }
+        }
+    }
+
+    suspend fun applyFilter(filterText: String) {
+        contactsMutex.withLock {
+            val filteredContacts = contactsStore.filterContacts(filterText)
+            _contacts.value = filteredContacts
+
+            // Update selected contact if necessary
+            stateMutex.withLock {
+                _selectedContact.value?.let { currentSelected ->
+                    _selectedContact.value = filteredContacts.find {
+                        it.phoneNumber == currentSelected.phoneNumber
+                    }
+                }
+            }
+        }
+    }
+
+    // Thread-safe state updates
+    suspend fun updateForwardingState(active: Boolean) {
+        stateMutex.withLock {
+            _forwardingActive.value = active
+            prefsManager.saveForwardingStatus(active)
+            if (!active) {
+                _selectedContact.value = null
+                _forwardingPhoneNumber.value = ""
+            }
+        }
+    }
+
 
     /**
      * Zentrale Funktion zum Verwalten des Weiterleitungsstatus
@@ -726,7 +774,9 @@ class ContactsViewModel(
     fun initialize() {
         viewModelScope.launch {
             try {
-                _isLoading.value = true
+                stateMutex.withLock {
+                    _isLoading.value = true
+                }
 
                 // Lade gespeicherte Einstellungen
                 loadSavedState()
@@ -748,10 +798,14 @@ class ContactsViewModel(
                 // Starte Collection in separatem Launch-Block
                 viewModelScope.launch {
                     contactsStore.contacts.collect { contactsList ->
-                        _contacts.value = contactsList
+                        updateContacts(contactsList)
                     }
                 }
-
+                viewModelScope.launch {
+                    contactsStore.contacts.collect { contactsList ->
+                        updateContacts(contactsList)
+                    }
+                }
                 LoggingManager.logInfo(
                     component = "ContactsViewModel",
                     action = "INIT",
@@ -2536,7 +2590,7 @@ class Logger(
                 for (i in entries.length - 1 downTo 0) {
                     val entry = entries.item(i) as Element
                     val number = entry.getElementsByTagName("number").item(0).textContent
-                    append("$number: ${process(entry)}")
+                    append(process(entry))
                 }
             }
         } catch (e: Exception) {
@@ -2544,7 +2598,6 @@ class Logger(
             ""
         }
     }
-
 
     private val highlightPatterns = listOf(
         "ACTIVATE_FORWARDING",
@@ -2618,17 +2671,37 @@ class Logger(
         append(HTML_FOOTER)
     }
 
+    private fun filterNonAscii(text: String): String {
+        val germanReplacements = mapOf(
+            'ä' to "ae",
+            'ö' to "oe",
+            'ü' to "ue",
+            'Ä' to "Ae",
+            'Ö' to "Oe",
+            'Ü' to "Ue",
+            'ß' to "ss"
+        )
+
+        return text.map { char ->
+            when {
+                germanReplacements.containsKey(char) -> germanReplacements[char]
+                char.code in 32..126 || char == '\n' || char == '\r' || char == '\t' -> char.toString()
+                else -> ""
+            }
+        }.joinToString("")
+    }
+
     fun getLogEntriesAsCsv(): String = buildString {
-        append("Nr;Datum;Zeit;Eintrag\n") // CSV-Header mit Nummer-Spalte
+        append("Nr;Datum;Zeit;Eintrag\n")
         append(readLogEntries { entry ->
             val timestamp = entry.getElementsByTagName("time").item(0).textContent
-            val text = entry.getElementsByTagName("text").item(0).textContent
+            val text = filterNonAscii(entry.getElementsByTagName("text").item(0).textContent)
             val number = entry.getElementsByTagName("number").item(0)?.textContent ?: "N/A"
 
             val (date, time) = timestamp.split(" ", limit = 2)
             val replacedText = replaceSpecialCharacters(text)
 
-            "$number;$date;$time;$replacedText\n" // Nummer hinzufügen
+            "$number;$date;$time;$replacedText\n"
         })
     }
 

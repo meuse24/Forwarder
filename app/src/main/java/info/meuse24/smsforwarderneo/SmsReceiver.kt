@@ -8,16 +8,19 @@ import android.app.Service
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
+import android.net.ConnectivityManager
 import android.os.Bundle
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.os.PowerManager
 import android.provider.Telephony
+import android.telephony.ServiceState
 import android.telephony.SmsMessage
+import android.telephony.TelephonyManager
 import android.util.Log
 import androidx.core.app.NotificationCompat
-import androidx.test.core.app.ActivityScenario.launch
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -32,7 +35,6 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import java.io.IOException
-import java.net.SocketException
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -65,6 +67,7 @@ class SmsReceiver : BroadcastReceiver() {
                     )
                 }
             }
+
             "SMS_SENT" -> handleSmsSent()
             else -> Log.d(TAG, "Unbekannte Aktion empfangen: ${intent.action}")
         }
@@ -152,10 +155,9 @@ class SmsForegroundService : Service() {
     private val wakeLockTag = "${BuildConfig.APPLICATION_ID}:ForegroundService"
     private var restartAttempts = 0
     private var lastRestartTime = 0L
-    private  val maxRestartAttemps = 3
-    private  val restartCoolDownMS = 5000L  // 5 Sekunden Abkühlzeit
-    private  val restartResetMS = 60000L    // Reset Zähler nach 1 Minute
-
+    private val maxRestartAttemps = 3
+    private val restartCoolDownMS = 5000L  // 5 Sekunden Abkühlzeit
+    private val restartResetMS = 60000L    // Reset Zähler nach 1 Minute
     private val serviceHandler = Handler(Looper.getMainLooper())
     private val heartbeatRunnable = Runnable {
         serviceScope.launch {
@@ -189,7 +191,6 @@ class SmsForegroundService : Service() {
 
         @Volatile
         private var isRunning = false
-
         fun startService(context: Context) {
             if (!isRunning) {
                 val intent = Intent(context, SmsForegroundService::class.java)
@@ -316,6 +317,7 @@ class SmsForegroundService : Service() {
                         startForegroundService()
                     }
                 }
+
                 "PROCESS_SMS" -> {
                     if (!isRunning) {
                         startForegroundService()
@@ -346,6 +348,7 @@ class SmsForegroundService : Service() {
                         )
                     }
                 }
+
                 else -> {
                     LoggingManager.logWarning(
                         component = "SmsForegroundService",
@@ -374,7 +377,7 @@ class SmsForegroundService : Service() {
     }
 
     private suspend fun processSmsData(extras: Bundle) {
-        withWakeLock(2 * 60 * 1000L) { // 2 Minuten für SMS-Verarbeitung
+        withWakeLock(2 * 60 * 1000L) {
             try {
                 val smsIntent = Intent().apply {
                     action = Telephony.Sms.Intents.SMS_RECEIVED_ACTION
@@ -382,25 +385,36 @@ class SmsForegroundService : Service() {
                 }
 
                 val messages = Telephony.Sms.Intents.getMessagesFromIntent(smsIntent)
-                if (messages.isNullOrEmpty()) {
+                    ?.takeIf { it.isNotEmpty() }
+                    ?: run {
+                        LoggingManager.logWarning(
+                            component = "SmsForegroundService",
+                            action = "PROCESS_SMS",
+                            message = "Keine gültigen SMS-Nachrichten im Intent"
+                        )
+                        return@withWakeLock
+                    }
+
+                val messageParts = messages.mapNotNull { smsMessage ->
+                    smsMessage?.originatingAddress?.let { sender ->
+                        smsMessage.messageBody?.let { body ->
+                            SmsMessagePart(
+                                body = body,
+                                timestamp = smsMessage.timestampMillis,
+                                referenceNumber = smsMessage.messageRef,
+                                sequencePosition = smsMessage.indexOnIcc,
+                                totalParts = messages.size,
+                                sender = sender
+                            )
+                        }
+                    }
+                }.takeIf { it.isNotEmpty() } ?: run {
                     LoggingManager.logWarning(
                         component = "SmsForegroundService",
                         action = "PROCESS_SMS",
-                        message = "Keine SMS-Nachrichten gefunden"
+                        message = "Keine gültigen Nachrichtenteile extrahiert"
                     )
                     return@withWakeLock
-                }
-
-                val messageParts = messages.mapNotNull { smsMessage ->
-                    val sender = smsMessage.originatingAddress ?: return@mapNotNull null
-                    SmsMessagePart(
-                        body = smsMessage.messageBody,
-                        timestamp = smsMessage.timestampMillis,
-                        referenceNumber = smsMessage.messageRef,
-                        sequencePosition = smsMessage.indexOnIcc,
-                        totalParts = messages.size,
-                        sender = sender
-                    )
                 }
 
                 val messageGroups = messageParts.groupBy {
@@ -494,7 +508,11 @@ class SmsForegroundService : Service() {
         }
     }
 
-    private fun handleProcessingError(sender: String, parts: List<SmsMessagePart>, error: Exception) {
+    private fun handleProcessingError(
+        sender: String,
+        parts: List<SmsMessagePart>,
+        error: Exception
+    ) {
         try {
             LoggingManager.logError(
                 component = "SmsForegroundService",
@@ -528,9 +546,9 @@ class SmsForegroundService : Service() {
 
     private fun shouldRetry(error: Exception): Boolean {
         return when (error) {
-            is IOException,
-            is SocketException,
+            is IOException,         // Dies deckt auch SocketException ab
             is MessagingException -> true
+
             else -> false
         }
     }
@@ -553,7 +571,7 @@ class SmsForegroundService : Service() {
         }
     }
 
-    private suspend fun forwardSms(targetNumber: String, message: String) {
+    private fun forwardSms(targetNumber: String, message: String) {
         try {
             if (message.length > 1600) {
                 LoggingManager.logWarning(
@@ -605,7 +623,7 @@ class SmsForegroundService : Service() {
             field.isAccessible = true
             field.getInt(this)
         } catch (e: Exception) {
-            0 // Fallback wenn nicht verfügbar
+            0
         }
 
     private fun handleEmailForwarding(sender: String, messageBody: String) {
@@ -660,7 +678,13 @@ class SmsForegroundService : Service() {
                             SnackbarManager.showSuccess("SMS per Email weitergeleitet")
                             updateServiceStatus()
                         }
-                        is EmailResult.Error -> handleEmailError(result.message, sender, emailAddresses, host)
+
+                        is EmailResult.Error -> handleEmailError(
+                            result.message,
+                            sender,
+                            emailAddresses,
+                            host
+                        )
                     }
                 } catch (e: Exception) {
                     LoggingManager.logError(
@@ -679,7 +703,12 @@ class SmsForegroundService : Service() {
         }
     }
 
-    private fun handleEmailError(errorMessage: String, sender: String, recipients: List<String>, host: String) {
+    private fun handleEmailError(
+        errorMessage: String,
+        sender: String,
+        recipients: List<String>,
+        host: String
+    ) {
         LoggingManager.logError(
             component = "SmsForegroundService",
             action = "EMAIL_FORWARD",
@@ -785,7 +814,10 @@ class SmsForegroundService : Service() {
 
     private fun scheduleHeartbeat() {
         serviceHandler.removeCallbacks(heartbeatRunnable) // Entferne vorherige Callbacks
-        serviceHandler.postDelayed(heartbeatRunnable, 60_000) // Plane nächsten Heartbeat in 1 Minute
+        serviceHandler.postDelayed(
+            heartbeatRunnable,
+            60_000
+        ) // Plane nächsten Heartbeat in 1 Minute
     }
 
     private suspend fun monitorService() {
@@ -954,6 +986,7 @@ class SmsForegroundService : Service() {
                 error = e
             )
         } finally {
+            serviceHandler.removeCallbacksAndMessages(null)
             super.onDestroy()
         }
     }
